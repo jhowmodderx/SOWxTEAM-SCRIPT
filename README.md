@@ -1,5 +1,5 @@
 
-# 💜 SOWxTEAM
+# 💜 SOWxTEAM 💜
 
 ![Version](https://img.shields.io/badge/Version-1.0.0-8A2BE2?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-Online-8A2BE2?style=for-the-badge)
@@ -10,4 +10,4 @@
 loadstring(game:HttpGet("https://raw.githubusercontent.com/jhowmodderx/SOWxTEAM-SCRIPT/refs/heads/main/LoaderCaTaLyST"))()
 ```
 
-**💜 SOWxTEAM | Version 1.0.0**
+** SOWxTEAM | Version 1.3.12**
