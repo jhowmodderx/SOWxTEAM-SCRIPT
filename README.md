@@ -7,7 +7,7 @@
 ### 🐉 SOWxTEAM Loader
 
 ```lua
-loadstring(game:HttpGet("SEU_LINK_RAW"))()
+loadstring(game:HttpGet("https://raw.githubusercontent.com/jhowmodderx/SOWxTEAM-SCRIPT/refs/heads/main/LoaderCaTaLyST"))()
 ```
 
 **💜 SOWxTEAM | Version 1.0.0**
