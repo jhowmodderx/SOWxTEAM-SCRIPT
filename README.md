@@ -10,4 +10,4 @@
 loadstring(game:HttpGet("https://raw.githubusercontent.com/jhowmodderx/SOWxTEAM-SCRIPT/refs/heads/main/LoaderCaTaLyST"))()
 ```
 
-** SOWxTEAM | Version 1.3.12**
+**SOWxTEAM | Version 1.3.12**
