@@ -7793,10 +7793,7 @@ bossGuardian=(function()
             end
         end
         if travel then control=false;return end
-        if maximum and maximum>0 then
-            if hp/maximum<=0.35 then recovering=true end
-            if recovering and hp/maximum>=0.7 then recovering=false end
-        end
+        recovering=false
         if os.clock()<nextDecision then return end
         nextDecision=os.clock()+0.1
         info.health=hp;info.maxHealth=maximum
