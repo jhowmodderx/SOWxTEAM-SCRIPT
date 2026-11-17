@@ -24,6 +24,30 @@ local state = {
     position = "atrás", keys = {Z = true, X = true}, fov = 70, travelSpeed = 270,
 }
 local connections, highlights = {}, {}
+local function trainingOwned(data,event)
+    if type(data)~="table"then return false end
+    if event.ability then return(tonumber(data.Abilitys and data.Abilitys[event.ability])or 0)>0 end
+    local names={[event.style]=true}
+    if event.style=="Eletric"or event.style=="Electric"then names.Eletric=true;names.Electric=true end
+    local tools=data.Tools or {}
+    for name in pairs(names)do if tools.Mastery and tools.Mastery[name]~=nil then return true end end
+    for _,key in ipairs({"Equiped","Unequiped","Bank"})do
+        for id,item in pairs(type(tools[key])=="table"and tools[key]or {})do
+            local name=type(item)=="table"and item.Name or type(item)=="string"and item or nil
+            if names[name]or(type(id)=="string"and names[id]and item~=false)then return true end
+        end
+    end
+    for _,container in ipairs({player.Character,player:FindFirstChildOfClass("Backpack")})do
+        if container then for name in pairs(names)do local tool=container:FindFirstChild(name);if tool and tool:IsA("Tool")then return true end end end
+    end
+    return false
+end
+local function trainingColor(data,event,definition,level)
+    if trainingOwned(data,event)then return " 🔵"end
+    local required=type(definition)=="table"and tonumber(definition.MinLevel or definition.Level or definition.RequiredLevel)
+    if required and level then return level>=required and " 🟢"or " 🔴"end
+    return "" -- Unknown requirements must not be displayed as insufficient level.
+end
 local attackController, bossControl, materialControl, materialDropdown, floatingMenu, responsiveMenu, skillAim, autoStats, storyController, bossGuardian, stormController, seaBeastController, eventSwordController
 local target, oldFov, fovCamera, lastError, questNames, cachedEnemies = nil, nil, nil, {}, {}, {}
 local levelLabel, currentLevel, nextCache = nil, nil, 0
@@ -563,6 +587,12 @@ combatSelection=(function()
         usesBasic=function()return kind(state.weapon)~="Fruit" or hasFruitM1(state.weapon) end,
         update=function()
             local available=listTools()
+            if state.forceMelee then
+                local melees={}
+                for name in pairs(available)do if kind(name)=="Melee"then melees[#melees+1]=name end end
+                table.sort(melees)
+                if melees[1]then state.weapon=melees[1];state.equipStatus="MELEE OBRIGATORIO: "..melees[1];return true end
+            end
             -- All bosses and dodge returns share the farm's selected loadout.
             local bossMode=false
             state.bossMeleeFruit=false
@@ -4204,7 +4234,7 @@ storyController=(function()
         eventRequestSerial=eventRequestSerial+1
         if chestBoatBridge then pcall(chestBoatBridge.stop)end
         enabled=false;route=nil;npcHold=nil;focus=nil;target=nil;questNames={}
-        state.story=false;state.farm=false;state.quests=false;state.attack=false;state.skills=false
+        state.story=false;state.farm=false;state.quests=false;state.attack=false;state.skills=false;state.forceMelee=false
         eventQuest=nil;info.eventQuest=nil
         if cartWalk then local _,hum,root=character();if hum and root then hum:MoveTo(root.Position)end;cartWalk=nil end
         pcall(clearHeld,true)
@@ -6747,8 +6777,14 @@ storyController=(function()
         end
         info.inactiveHistory=nil;noActiveSince=nil
         if not obj then
+            state.forceMelee=false
             if dialogue()then return end
             stopCombat();route=nil;setPhase("AGUARDANDO REQUISITO DA ETAPA");return
+        end
+        do
+            local objId=tostring(obj.ObjectiveID or ""):lower()
+            local desc=tostring(sub and sub.Description or ""):lower()
+            state.forceMelee=(name=="Vox Armor Training"and objId:find("boar",1,true)~=nil)or objId:find("giantboar",1,true)~=nil or desc:find("só socos",1,true)~=nil or desc:find("so socos",1,true)~=nil or desc:find("melee",1,true)~=nil
         end
         local token=name..":"..key..":"..obj.ObjectiveID
         if obj.ObjectiveID=="Deliver_SupplyCart_VAL"then token=token..":"..tostring(player:GetAttribute("ValoriaCartState"))end
@@ -7195,10 +7231,7 @@ storyController=(function()
         route=nil;npcHold=nil;pendingTransition=nil;manualShop=nil
         setPhase("PESCA: PREPARANDO VARA NA POSICAO ATUAL")
     end})
-    eventLearned=function(data,event)
-        if event.ability then return(tonumber(data.Abilitys and data.Abilitys[event.ability])or 0)>0 end
-        return data.Tools and data.Tools.Mastery and data.Tools.Mastery[event.style]~=nil
-    end
+    eventLearned=trainingOwned
     local function startStyleEvent(event)
         assert(type(event)=="table"and type(event.quest)=="string"and type(event.npc)=="string","Evento inválido")
         if enabled then
@@ -7226,7 +7259,7 @@ storyController=(function()
         if required then
             assert(level,"Nível do personagem ainda indisponível")
             if level<required then
-                notify("Você não tem nível suficiente para "..event.style..". Nível mínimo: "..required.." | Seu nível: "..level)
+                notify("Você não tem o nível mínimo necessário ("..required..") para "..event.style..".")
                 return false
             end
         end
@@ -7234,22 +7267,28 @@ storyController=(function()
             local ok,allowed=pcall(types.QuestsUtils.CanTake,player,event.quest)
             assert(ok,"Não foi possível validar os requisitos do treinamento")
             if allowed==false then
-                notify("Treinamento bloqueado pelos requisitos do jogo: "..event.style)
+                notify("O jogo recusou os requisitos adicionais de "..event.style..". O nivel foi verificado separadamente.")
                 return false
             end
         end
         for index=1,7 do
             local other=Fluent.Options["EventStyle"..index]
-            if other and other.Value and other.Title~=event.style then pcall(function()other:SetValue(false)end)end
+            if other and other.Value and not tostring(other.Title):find(event.style,1,true)then pcall(function()other:SetValue(false)end)end
         end
+        -- Register the event before disabling the regular story farm: its off callback
+        -- must not mistake the incoming training for ordinary story progression.
+        eventQuest=event;info.eventQuest=event.quest
         if farmControl and farmControl.Value then pcall(function()farmControl:SetValue(false)end)end
         if Fluent.Options.EventSwordFarm and Fluent.Options.EventSwordFarm.Value then pcall(function()Fluent.Options.EventSwordFarm:SetValue(false)end)end
         if Fluent.Options.SeaBeastFarm and Fluent.Options.SeaBeastFarm.Value then pcall(function()Fluent.Options.SeaBeastFarm:SetValue(false)end)end
         if Fluent.Options.SeaBeastOnly and Fluent.Options.SeaBeastOnly.Value then pcall(function()Fluent.Options.SeaBeastOnly:SetValue(false)end)end
-        storyToggle:SetValue(true)
-        if request~=eventRequestSerial then stopStory();pcall(function()storyToggle:SetValue(false)end);return false end
-        assert(enabled,"Não foi possível iniciar o treinamento")
+        -- Previous event/movement-mode callbacks can intentionally stop the old controller.
+        -- Create the new request after that cleanup, then publish its quest before startup yields.
+        eventRequestSerial=eventRequestSerial+1;request=eventRequestSerial
         eventQuest=event;info.eventQuest=event.quest;auxiliaries[event.quest]=true
+        storyToggle:SetValue(true)
+        if request~=eventRequestSerial then return false end
+        if not enabled then eventQuest=nil;info.eventQuest=nil;error("Nao foi possivel iniciar o treinamento")end
         return true
     end
     return {setStory=setStory,startEvent=startStyleEvent,tick=tick,step=step,followFish=function()minigameBridge.follow()end,stop=stopStory,active=function()return enabled end,blocked=function()return halted()or locked("Converse")end,pick=function()return focus and valid(focus)and focus or nil end,debug=function()return info end,disable=function()stopStory();pcall(function()storyToggle:SetValue(false)end)end}
@@ -7275,19 +7314,34 @@ do
         {style="Haki do Armamento",quest="Vox Armor Training",npc="Askard",ability="Busoshoku",requiresAbility="Kenbushoku"},
     }
     local startingStyles={}
+    local syncingStyle=false
+    local function syncStyleOption(option,value)
+        syncingStyle=true
+        local ok,err=uiCall(function()option:SetValue(value)end)
+        syncingStyle=false
+        if not ok then failure("Switch do treinamento",err)end
+    end
+    tabs.events:AddParagraph({Title="",Content="🟢 Tem nível  |  🔴 Sem nível  |  🔵 Já possui"})
     local training=tabs.events:AddSection("Estilos de luta")
     local powers=tabs.events:AddSection("Geppo, Soru e Haki")
     for index,event in ipairs(styles)do
         local section=event.ability and powers or training
         local control=section:AddToggle("EventStyle"..index,{Title=event.style,Default=false,Callback=function(value)
+            if syncingStyle then return end
             if value then
+                if startingStyles[index]then return end
                 startingStyles[index]=true
+                task.defer(function()
                 local started
                 local ok=guard("Treinamento "..event.style,function()started=storyController.startEvent(event)end)
                 startingStyles[index]=nil
                 local option=Fluent.Options["EventStyle"..index]
-                if(not ok or started==false)and option then option:SetValue(false)end
-                if option and not option.Value and storyController.debug().eventQuest==event.quest then storyController.disable()end
+                if option then task.defer(function()
+                    if startingStyles[index]then return end
+                    local active=storyController.active()and storyController.debug().eventQuest==event.quest
+                    syncStyleOption(option,ok and started~=false and active)
+                end)end
+                end)
             else
                 local other=false
                 for otherIndex=1,#styles do
@@ -7301,9 +7355,25 @@ do
     end
     loop("Estado dos eventos",1,function()
         local active=storyController.debug().eventQuest
+        local defs,data,typesMod
+        pcall(function()
+            local r=game:GetService("ReplicatedStorage")
+            defs=require(r.Shared.MainModules.ProgressUtils.QuestsInfo)
+            typesMod=require(r.Shared.MainModules)
+            data=clientAPI().DataStore.IsClient:Get()
+        end)
+        local level=(data and data.Statistics and tonumber(data.Statistics.Level))or currentLevel
         for index,event in ipairs(styles)do
             local option=Fluent.Options["EventStyle"..index]
-            if option and option.Value and not startingStyles[index]and active~=event.quest then option:SetValue(false)end
+            if option and not startingStyles[index]then
+                local wanted=storyController.active()and active==event.quest
+                if option.Value~=wanted then syncStyleOption(option,wanted)end
+            end
+            if option and type(option.SetTitle)=="function"then
+                local tag=trainingColor(data,event,defs and defs[event.quest],level)
+                local wanted=event.style..tag
+                if option.Title~=wanted then pcall(function()option:SetTitle(wanted)end)end
+            end
         end
 
     end)
