@@ -4757,16 +4757,37 @@ storyController=(function()
             or text:match("come back in %d+ seconds")or text:match("come back in %d+:%d%d")
             or text:match("volte em %d+:%d%d")or text:match("retorne em %d+:%d%d")
         if not confirmed then return false end
+        local waitSeconds=type(remaining)=="number"and remaining>0 and remaining or nil
+        if not waitSeconds then
+            local m,s=text:match("(%d+):(%d%d)")
+            if m and s then waitSeconds=tonumber(m)*60+tonumber(s)
+            else
+                local sec=text:match("(%d+)%s*seconds?")
+                if sec then waitSeconds=tonumber(sec)end
+            end
+        end
+        waitSeconds=math.max(5,waitSeconds or 15)
         stopStory()
         if storyToggle and storyToggle.Value then pcall(function()storyToggle:SetValue(false)end)end
-        info.cooldown=message;info.cooldownRemaining=remaining
-        setPhase("FARM PARADO: COOLDOWN DA MISSAO : "..message)
-        local content="COOLDOWN DA MISSAO: "..message.." | FARM HISTORIA PARADO"
+        info.cooldown=message;info.cooldownRemaining=waitSeconds
+        setPhase("COOLDOWN DA MISSAO ("..tostring(waitSeconds).."s): "..message)
+        local content="COOLDOWN DA MISSAO: "..message.." | RETOMANDO AUTOMATICAMENTE EM "..tostring(waitSeconds).."s"
         local shown=pcall(notify,content)
         if not shown then
-            pcall(function()game:GetService("StarterGui"):SetCore("SendNotification",{Title="SOWXTEAM: COOLDOWN",Text=content,Duration=12})end)
+            pcall(function()game:GetService("StarterGui"):SetCore("SendNotification",{Title="SOWXTEAM: COOLDOWN",Text=content,Duration=20})end)
         end
         warn(content)
+        local ticket=(info.cooldownTicket or 0)+1
+        info.cooldownTicket=ticket
+        task.delay(waitSeconds+1,function()
+            if info.cooldownTicket~=ticket or not state.alive or Fluent.Unloaded then return end
+            if state.farm or (farmControl and farmControl.Value) or (bossControl and bossControl.Value) or (materialControl and materialControl.Value) then return end
+            if Fluent.Options.FarmMode and state.farmMode~="História" then pcall(function()Fluent.Options.FarmMode:SetValue("História")end) end
+            state.farmMode="História"
+            if farmControl then pcall(function()farmControl:SetValue(true)end)
+            elseif storyToggle then pcall(function()storyToggle:SetValue(true)end) end
+            pcall(notify,"Cooldown finalizado! Retomando o Farm História automaticamente.")
+        end)
         return true
     end
     local function timedQuestCooldown(obj,sub)
