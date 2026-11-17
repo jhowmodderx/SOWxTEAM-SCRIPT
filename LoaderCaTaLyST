@@ -7221,12 +7221,12 @@ storyController=(function()
             local gold=data.Statistics and tonumber(data.Statistics.Gold)
             if gold and gold<event.price then notify("O treinamento exige "..event.price.." moedas.");return false end
         end
-        local required=tonumber(definition.MinLevel)
-        local level=data.Statistics and tonumber(data.Statistics.Level)
+        local required=tonumber(definition.MinLevel or definition.Level or definition.RequiredLevel)
+        local level=tonumber(data.Statistics and data.Statistics.Level)or currentLevel or readLevel()
         if required then
             assert(level,"Nível do personagem ainda indisponível")
             if level<required then
-                notify("Nível mínimo para "..event.style..": "..required..". Seu nível atual: "..level)
+                notify("Você não tem nível suficiente para "..event.style..". Nível mínimo: "..required.." | Seu nível: "..level)
                 return false
             end
         end
