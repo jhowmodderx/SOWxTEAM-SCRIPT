@@ -1,4 +1,4 @@
--- Luau / SOWxTEAM-1.3.242.luau / Roblox client + executor / Vox Seas 104067066727140
+-- Luau / SOWxTEAM-1.3.264.luau / Roblox client + executor / Vox Seas 104067066727140
 -- Fluent upstream: github.com/dawid-scripts/Fluent. Runtime integration not yet verified.
 local Players = game:GetService("Players")
 local RS = game:GetService("RunService")
@@ -16,14 +16,15 @@ local ok, Fluent = pcall(function()
 end)
 assert(ok and type(Fluent) == "table", "Falha ao carregar Fluent: " .. tostring(Fluent))
 local state = {
-    alive = true, farm = false, attack = false, skills = false, quests = false,
-    personalSpeed=false, walkSpeed=50, superJump=false, infiniteJump=false, freeFly=false, flySpeed=70,
-    bossMode = false, bossName = "mais próximo", esp = false, playerEsp = false, playerEspDistance = 200, travelAltitude = 30, bosses = false, distance = 5, height = 0, radius = 600,
+    alive = true, farm = false, farmMode = "Quest", attack = false, skills = false, quests = false,
+    materialFarm = false, materialName = nil, materialQuest = true,
+    personalSpeed=false, walkSpeed=50, superJump=false, infiniteJump=false, infiniteDash=false, freeFly=false, flySpeed=70,
+    bossMode = false, bossName = "mais próximo", esp = false, playerEsp = false, travelAltitude = 30, bosses = false, distance = 5, height = 0, radius = 600,
     interval = 0.3, skillInterval = 3, weapon = "Cutlass", fastAttack = true, fastAttackRate = 12, attackSuppressedUntil = 0,
     position = "atrás", keys = {Z = true, X = true}, fov = 70, travelSpeed = 270,
 }
 local connections, highlights = {}, {}
-local attackController, bossControl, floatingMenu, responsiveMenu, skillAim, autoStats, storyController, bossGuardian, stormController, seaBeastController
+local attackController, bossControl, materialControl, materialDropdown, floatingMenu, responsiveMenu, skillAim, autoStats, storyController, bossGuardian, stormController, seaBeastController, eventSwordController
 local target, oldFov, fovCamera, lastError, questNames, cachedEnemies = nil, nil, nil, {}, {}, {}
 local levelLabel, currentLevel, nextCache = nil, nil, 0
 local lastWeaponList = ""
@@ -68,13 +69,11 @@ local function internalStatus(settings)
 end
 local farmSections = {
     run = tabs.farm:AddSection("Farm automático"),
-    story = tabs.farm:AddSection("História"),
     sword = tabs.farm:AddSection("Equipamentos de combate"),
     attack = tabs.farm:AddSection("Ataque"),
-    skills = tabs.farm:AddSection("Skills"),
+    materials = tabs.farm:AddSection("Farm de materiais"),
     attributes = tabs.farm:AddSection("Auto atributos"),
     boss = tabs.farm:AddSection("Bosses"),
-    protection = tabs.farm:AddSection("Proteção contra bosses"),
     fishing = tabs.farm:AddSection("Pesca"),
     movement = tabs.farm:AddSection("Posição e deslocamento"),
 }
@@ -103,11 +102,11 @@ local function reliableToggle(option)
 end
 local function notify(text)
     local ok=uiCall(function()
-        Fluent:Notify({Title="SOWxTEAM | VOX SEAS | By RodrigoGTyx",Content=tostring(text),Duration=6})
+        Fluent:Notify({Title="SOWxTEAM | VOX SEAS | By RodrigoGTyx",Content=tostring(text),Duration=20})
     end)
     if not ok then
         pcall(function()game:GetService("StarterGui"):SetCore("SendNotification",{
-            Title="SOWxTEAM",Text=tostring(text),Duration=8})end)
+            Title="SOWxTEAM",Text=tostring(text),Duration=20})end)
     end
 end
 local lastFailure = "Nenhum erro registrado"
@@ -290,6 +289,15 @@ local function stepTravel(dt)
             route.progressPhase, route.bestRemaining, route.lastProgressAt = route.phase, remaining, now
         elseif remaining < route.bestRemaining - 1 then
             route.bestRemaining, route.lastProgressAt = remaining, now
+        elseif route.owner ~= "collectibles" and route.owner ~= "manual" and now - route.lastProgressAt > 12 then
+            if route.phase == "Aguardando solo" then
+                route.landing = Vector3.new(route.destination.X, route.destination.Y + 5, route.destination.Z)
+                route.phase = "Descendo"
+                route.lastProgressAt = now
+            else
+                cancelTravel()
+                return
+            end
         end
         local delta = waypoint - root.Position
         local step = state.travelSpeed * math.min(dt, 0.1)
@@ -360,13 +368,26 @@ local function enemyHealth(model)
     end
     return humanoid.Health,humanoid.MaxHealth,"HUMANOID"
 end
+local function materialRigReady(model,root)
+    if not state.materialFarm or not root then return false end
+    local _,_,ownRoot=character()
+    if not ownRoot or(root.Position-ownRoot.Position).Magnitude>150 then return false end
+    -- A replicated root alone is not a rendered rig. Never change native attributes.
+    local head=model:FindFirstChild("Head")
+    local torso=model:FindFirstChild("UpperTorso")or model:FindFirstChild("Torso")
+    if not head or not torso then return false end
+    for _,part in ipairs({head,torso})do
+        if part:IsA("BasePart")and part.Transparency<1 and part.LocalTransparencyModifier<1 then return true end
+    end
+    return false
+end
 local function valid(model)
     if not model or not model.Parent then return false end
     local hum, root = model:FindFirstChildOfClass("Humanoid"), model:FindFirstChild("HumanoidRootPart")
     local health=enemyHealth(model)
     return hum and root and health and health > 0 and model:GetAttribute("Dead") ~= true
         and model:GetAttribute("Ready") ~= false
-        and model:GetAttribute("Render") ~= false
+        and (model:GetAttribute("Render") ~= false or materialRigReady(model,root))
         and (state.bosses or state.story or model:GetAttribute("IsBoss") ~= true)
 end
 local function readLevel()
@@ -391,15 +412,15 @@ local function readLevel()
 end
 local function pickTarget()
     local _, hum, root = character()
-    if not hum or hum.Health <= 0 or not root or not currentLevel or (state.quests and not questReady) then return nil end
+    if not hum or hum.Health <= 0 or not root or (not state.materialFarm and not currentLevel) or (state.quests and not questReady) then return nil end
     local best, bestGap, nearest = nil, math.huge, math.huge
     for _, model in ipairs(cachedEnemies) do
         if valid(model) and (next(questNames) == nil or questNames[original(model)]) then
             local level = tonumber(model:GetAttribute("Level"))
-            if state.quests or (level and level <= currentLevel + 10) then
+            if state.quests or state.materialFarm or (level and level <= currentLevel + 10) then
                 local distance = (root.Position - model.HumanoidRootPart.Position).Magnitude
-                local gap = level and math.abs(level - currentLevel) or 0
-                if (state.quests or distance <= state.radius) and (gap < bestGap or (gap == bestGap and distance < nearest)) then
+                local gap = (state.materialFarm and 0) or (level and math.abs(level - currentLevel) or 0)
+                if (state.quests or state.materialFarm or distance <= state.radius) and (gap < bestGap or (gap == bestGap and distance < nearest)) then
                     best, bestGap, nearest = model, gap, distance
                 end
             end
@@ -407,8 +428,8 @@ local function pickTarget()
     end
     -- Retem o alvo vivo do mesmo nivel para nao alternar a cada pequeno movimento.
     if valid(target) and best and (next(questNames) == nil or questNames[original(target)])
-        and target:GetAttribute("Level") == best:GetAttribute("Level")
-        and (state.quests or (root.Position - target.HumanoidRootPart.Position).Magnitude <= state.radius) then return target end
+        and (state.materialFarm or target:GetAttribute("Level") == best:GetAttribute("Level"))
+        and (state.quests or state.materialFarm or (root.Position - target.HumanoidRootPart.Position).Magnitude <= state.radius) then return target end
     return best
 end
 local combatSelection
@@ -728,9 +749,51 @@ local noclip = (function()
     return {set = set, stop = function() owners = {}; bind(nil) end}
 end)()
 
-local farmControl = farmSections.run:AddToggle("FarmAutomatico", {Title = "Farm automático", Default = false, Callback = function(value)
-    if value and storyController and storyController.active()then storyController.disable()end
-    if value and bossControl and bossControl.Value then bossControl:SetValue(false) end
+local farmControl
+farmSections.run:AddDropdown("FarmMode", {Title = "Tipo de farm", Values = {"Quest", "História"}, Default = "Quest", Callback = function(value)
+    local newMode = value == "História" and "História" or "Quest"
+    local changed = state.farmMode ~= newMode
+    state.farmMode = newMode
+    if changed and farmControl and farmControl.Value then
+        if newMode == "História" then
+            state.quests = false
+            questReady, questNames, target = false, {}, nil
+            if travel and travel.owner == "farm" then cancelTravel() end
+            guard("Restaurar noclip quest", function() noclip.set("farm", false) end)
+            if storyController and storyController.setStory then storyController.setStory(true) end
+        else
+            if storyController and storyController.active() then storyController.disable() end
+            state.farm, state.attack, state.skills, state.quests = true, true, true, true
+            quietQuestHUD(true)
+            guard("Noclip do farm", function() noclip.set("farm", true) end)
+            target, questReady, questPhase, nextCache = nil, false, "Buscando quest", 0
+            currentLevel = readLevel()
+        end
+    end
+end})
+farmControl = farmSections.run:AddToggle("FarmAutomatico", {Title = "Farm automático", Default = false, Callback = function(value)
+    if value then
+        if bossControl and bossControl.Value then bossControl:SetValue(false) end
+        if materialControl and materialControl.Value then materialControl:SetValue(false) end
+        if Fluent.Options.CollectibleFarm and Fluent.Options.CollectibleFarm.Value then pcall(function() Fluent.Options.CollectibleFarm:SetValue(false) end) end
+        if Fluent.Options.FishingFarm and Fluent.Options.FishingFarm.Value then pcall(function() Fluent.Options.FishingFarm:SetValue(false) end) end
+        if Fluent.Options.EventSwordFarm and Fluent.Options.EventSwordFarm.Value then pcall(function() Fluent.Options.EventSwordFarm:SetValue(false) end) end
+        if Fluent.Options.SeaBeastFarm and Fluent.Options.SeaBeastFarm.Value then pcall(function() Fluent.Options.SeaBeastFarm:SetValue(false) end) end
+        if Fluent.Options.SeaBeastOnly and Fluent.Options.SeaBeastOnly.Value then pcall(function() Fluent.Options.SeaBeastOnly:SetValue(false) end) end
+        if Fluent.Options.FreeFly and Fluent.Options.FreeFly.Value then pcall(function() Fluent.Options.FreeFly:SetValue(false) end) end
+        if state.farmMode == "História" then
+            state.quests = false
+            questReady, questNames, target = false, {}, nil
+            if travel and travel.owner == "farm" then cancelTravel() end
+            if storyController and storyController.setStory then storyController.setStory(true) end
+            return
+        end
+        if storyController and storyController.active() then storyController.disable() end
+    else
+        if storyController and storyController.active() and not (storyController.debug().eventQuest) and not state.fishing then
+            storyController.disable()
+        end
+    end
     state.farm, state.attack, state.skills, state.quests = value, value, value, value
     quietQuestHUD(value)
     guard("Noclip do farm", function() noclip.set("farm", value) end)
@@ -748,7 +811,7 @@ numericOption("Distance", "distance", 5, 2, 15)
 numericOption("Height", "height", 0, -5, 15)
 numericOption("Radius", "radius", 600, 20, 2500)
 numericOption("TravelSpeed", "travelSpeed", 270, 30, 500)
-farmSections.skills:AddDropdown("Skills", {Title = "Selecionar skills de combate", Values = {"Z", "X", "C", "V", "F"}, Multi = true, Default = {"Z", "X"}, Callback = function(values)
+farmSections.sword:AddDropdown("Skills", {Title = "Selecionar skills de combate", Values = {"Z", "X", "C", "V", "F"}, Multi = true, Default = {"Z", "X"}, Callback = function(values)
     for _, key in ipairs({"Z", "X", "C", "V", "F"}) do state.keys[key] = values[key] == true end
 end})
 
@@ -759,9 +822,6 @@ numericOption("AttackInterval", "interval", 0.3, 0.15, 2)
 numericOption("SkillInterval", "skillInterval", 3, 1, 12)
 toggle(tabs.visual, "ESP", "ESP inimigos", "esp")
 toggle(tabs.visual, "PlayerESP", "ESP jogadores", "playerEsp")
-tabs.visual:AddSlider("PlayerESPDistance", {Title = "Distância do ESP jogadores (m)", Default = 200, Min = 10, Max = 10000, Rounding = 0, Callback = function(value)
-    state.playerEspDistance = math.clamp(tonumber(value) or 200, 10, 10000)
-end})
 tabs.visual:AddSlider("FOV", {Title = "Campo de visao", Default = 70, Min = 40, Max = 110, Rounding = 0, Callback = function(v)
     state.fov = tonumber(v) or state.fov
     local camera = workspace.CurrentCamera
@@ -859,6 +919,7 @@ local function teleportTo(position, island, searchLanding)
     if Fluent.Options.FreeFly and Fluent.Options.FreeFly.Value then Fluent.Options.FreeFly:SetValue(false)end
     if storyController and storyController.active()then storyController.disable()end
     if bossControl and bossControl.Value then bossControl:SetValue(false) end
+    if materialControl and materialControl.Value then materialControl:SetValue(false) end
     farmControl:SetValue(false)
     assert(beginTravel(position + Vector3.new(0, 5, 0), "Teleporte", "manual", island, searchLanding), "Aguarde o personagem renascer.")
 end
@@ -1169,9 +1230,266 @@ local function approachQuestGiver(quest)
     questPhase = "Abrindo dialogo; se nao abrir, interaja com " .. quest.giver
     questCooldown = os.clock() + 4
 end
+local materialCatalog, materialNames, materialSignature = {}, {}, ""
+local function parseChance(value)
+    if type(value) == "number" then return value end
+    if type(value) == "string" then return tonumber(value:match("([%d%.]+)")) or 0 end
+    return 0
+end
+local function refreshMaterialCatalog()
+    refreshQuestCatalog(false)
+    local found = {}
+    local replicated = game:GetService("ReplicatedStorage")
+    local infoRoot = replicated:FindFirstChild("Shared")
+    for _, name in ipairs({"MainModules", "EnemysUtils", "EnemysInfo"}) do infoRoot = infoRoot and infoRoot:FindFirstChild(name) end
+    local grinding = infoRoot and infoRoot:FindFirstChild("Grinding")
+    local questsByTarget = {}
+    for _, quest in ipairs(questCatalog) do
+        for _, obj in ipairs(quest.objectives or {}) do
+            questsByTarget[obj.target] = questsByTarget[obj.target] or {}
+            table.insert(questsByTarget[obj.target], quest)
+        end
+    end
+    if grinding then
+        for index, module in ipairs(grinding:GetDescendants()) do
+            if module:IsA("ModuleScript") then
+                local enemyName = module.Name
+                local quests = questsByTarget[enemyName]
+                -- Ignora modulos de inimigos removidos/nao spawnados que nao pertencem a nenhuma quest real do jogo:
+                if quests and #quests > 0 then
+                    local ok, data = pcall(require, module)
+                    local drops = ok and type(data) == "table" and type(data.Rewards) == "table" and data.Rewards.Drops
+                    if type(drops) == "table" then
+                        table.sort(quests, function(a, b) return a.minLevel < b.minLevel end)
+                        local quest = quests[1]
+                        local islandName = quest.island or (module.Parent and module.Parent.Name)
+                        local level = type(data.EnemyArguments) == "table" and tonumber(data.EnemyArguments.Level) or quest.minLevel or 1
+                        local altName = type(data.EnemyArguments) == "table" and data.EnemyArguments.AlternativeName
+                        for matName, dropSpec in pairs(drops) do
+                            if type(matName) == "string" and #matName > 0 then
+                                local chance = type(dropSpec) == "table" and parseChance(dropSpec.Chance) or parseChance(dropSpec)
+                                local entry = found[matName]
+                                if not entry then
+                                    entry = {name = matName, sources = {}, targets = {}}
+                                    found[matName] = entry
+                                end
+                                entry.targets[enemyName] = true
+                                if type(altName) == "string" and #altName > 0 then entry.targets[altName] = true end
+                                table.insert(entry.sources, {
+                                    enemy = enemyName,
+                                    altName = type(altName) == "string" and #altName > 0 and altName or nil,
+                                    island = islandName,
+                                    level = level,
+                                    chance = chance,
+                                    quest = quest,
+                                })
+                            end
+                        end
+                    end
+                end
+            end
+            if index % 25 == 0 then task.wait() end
+        end
+    end
+    local names = {}
+    for matName, entry in pairs(found) do
+        table.sort(entry.sources, function(a, b)
+            if math.abs((a.chance or 0) - (b.chance or 0)) > 0.01 then return (a.chance or 0) > (b.chance or 0) end
+            return (a.level or 0) < (b.level or 0)
+        end)
+        entry.primary = entry.sources[1]
+        table.insert(names, matName)
+    end
+    table.sort(names)
+    if #names > 0 then
+        materialCatalog, materialNames = found, names
+        local sig = table.concat(names, "\0")
+        if materialDropdown and sig ~= materialSignature then
+            materialSignature = sig
+            pcall(function() materialDropdown:SetValues(names) end)
+        end
+        if (not state.materialName or not materialCatalog[state.materialName]) and names[1] then
+            state.materialName = names[1]
+            if materialDropdown then pcall(function() materialDropdown:SetValue(names[1]) end) end
+        end
+    end
+    return names
+end
+local function chooseMaterialSource(matEntry, level)
+    if not matEntry or type(matEntry.sources) ~= "table" or #matEntry.sources == 0 then return nil end
+    local bestEligible, bestAny
+    for _, src in ipairs(matEntry.sources) do
+        if not bestAny or (src.chance or 0) > (bestAny.chance or 0) then bestAny = src end
+        if src.quest and level and level >= src.quest.minLevel then
+            if not bestEligible or (src.chance or 0) > (bestEligible.chance or 0) then bestEligible = src end
+        end
+    end
+    return bestEligible or matEntry.primary or bestAny
+end
+local materialStreamAt = 0
+local function updateMaterialFarm()
+    questReady = false
+    local matName = state.materialName
+    if (not matName or matName == "" or matName == "Carregando...") and materialDropdown and type(materialDropdown.Value) == "string" and materialDropdown.Value ~= "Carregando..." then
+        matName = materialDropdown.Value
+        state.materialName = matName
+    end
+    local matEntry = matName and materialCatalog[matName]
+    if not matEntry then
+        refreshMaterialCatalog()
+        matName = state.materialName
+        matEntry = matName and materialCatalog[matName]
+    end
+    if not matEntry then
+        questNames = {}
+        questPhase = "SELECIONE UM MATERIAL NA LISTA"
+        return
+    end
+    local src = chooseMaterialSource(matEntry, currentLevel)
+    if not src then
+        questNames = {}
+        questPhase = "SEM FONTE DE DROP PARA: " .. tostring(matName)
+        return
+    end
+    local targetQuest = src.quest
+    local island = src.island or (targetQuest and targetQuest.island)
+    local canTakeQuest = state.materialQuest and targetQuest and currentLevel and currentLevel >= targetQuest.minLevel
+    local modules = clientAPI()
+    local data = modules.DataStore.IsClient:Get()
+    local actives = data and data.Quests and data.Quests.Actives
+    local hasTargetQuest = canTakeQuest and type(actives) == "table" and actives[targetQuest.id] ~= nil
+    local activeGrindingQuest
+    if type(actives) == "table" then
+        for _, q in ipairs(questCatalog) do
+            if actives[q.id] then activeGrindingQuest = q; break end
+        end
+    end
+    -- Se pode pegar a quest do material e nao tem outra quest de outra ilha trancando (ou nenhuma ativa), vai pegar a quest:
+    if canTakeQuest and type(actives) == "table" and not hasTargetQuest and not activeGrindingQuest then
+        local npc, position = questGiver(targetQuest)
+        local _, hum, root = character()
+        if not hum or hum.Health <= 0 or not root then questPhase = "Aguardando personagem"; return end
+        if not position or (root.Position - position).Magnitude > 12 then
+            approachQuestGiver(targetQuest)
+            questPhase = "MATERIAL (" .. matName .. "): INDO ACEITAR MISSAO " .. targetQuest.id
+            return
+        end
+        if os.clock() >= questCooldown and not UIS:GetFocusedTextBox() then
+            if not npc then
+                questPhase = "MATERIAL (" .. matName .. "): AGUARDANDO QUEST GIVER CARREGAR"
+                pcall(function() player:RequestStreamAroundAsync(position, 2) end)
+                questCooldown = os.clock() + 2
+                return
+            end
+            remoteEvent("Quests"):FireServer("AcceptGrinding", targetQuest.id)
+            nextCache = 0
+            questPhase = "MATERIAL (" .. matName .. "): ACEITANDO MISSAO " .. targetQuest.id
+            questCooldown = os.clock() + 3.5
+            return
+        end
+    end
+    -- Define os alvos que dropam o material
+    local targets = {}
+    for _,source in ipairs(matEntry.sources)do
+        if source.island==src.island then
+            targets[source.enemy]=true
+            if source.altName then targets[source.altName]=true end
+        end
+    end
+    -- Preserve alternative names only for the selected island's sources.
+    for _,model in ipairs(cachedEnemies)do
+        local native=model:GetAttribute("OriginalName")
+        if native and targets[native]then targets[original(model)]=true end
+    end
+    if hasTargetQuest then
+        local pending, found = pendingObjectives(targetQuest)
+        if found and next(pending) ~= nil then
+            local filtered = {}
+            for enemyName in pairs(pending) do
+                if matEntry.targets[enemyName] then filtered[enemyName] = true end
+            end
+            if next(filtered) ~= nil then targets = filtered else targets = pending end
+        end
+    end
+    questNames = targets
+    local _, _, ownRoot = character()
+    local nearest, nearestSpawn, spawnPosition = math.huge, math.huge, nil
+    local function scanEnemy(model)
+        if model.Parent and targets[original(model)] and ownRoot and model:GetAttribute("Dead") ~= true then
+            local health = enemyHealth(model)
+            local enemyRoot = model:FindFirstChild("HumanoidRootPart")
+            -- Ignora modelos template escondidos no void (Y < -500) ou mortos
+            if enemyRoot and health and health > 0 and enemyRoot.Position.Y > -500 then
+                local distance = (ownRoot.Position - enemyRoot.Position).Magnitude
+                if valid(model) then nearest = math.min(nearest, distance) end
+                if distance < nearestSpawn then nearestSpawn, spawnPosition = distance, enemyRoot.Position end
+            end
+        end
+    end
+    for _, model in ipairs(cachedEnemies) do scanEnemy(model) end
+    if nearest == math.huge and not spawnPosition then
+        local folder = enemiesFolder()
+        if folder then
+            for _, obj in ipairs(folder:GetDescendants()) do
+                if obj:IsA("Model") and obj:FindFirstChildOfClass("Humanoid") then scanEnemy(obj) end
+            end
+        end
+        if spawnPosition then refreshLists() end
+    end
+    -- Se existe inimigo vivo e renderizado no mapa, libera o combate imediatamente!
+    if nearest < math.huge then
+        questReady = true
+        questPhase = "FARM MATERIAL: " .. matName .. " | ALVO: " .. src.enemy .. (hasTargetQuest and (" | MISSAO: " .. targetQuest.id) or "")
+        return
+    end
+    -- Se o inimigo existe mas esta com Render=false ou longe, voa bem perto do spawn dele para ativar o Render:
+    if ownRoot and spawnPosition then
+        if nearestSpawn > 18 then
+            beginTravel(spawnPosition + Vector3.new(0, 2, 5), "Material " .. matName .. " (" .. src.enemy .. ")", "farm", island)
+            questPhase = "MATERIAL (" .. matName .. "): INDO CARREGAR " .. src.enemy
+            return
+        end
+        if os.clock() >= materialStreamAt then
+            materialStreamAt = os.clock() + 1.5
+            task.spawn(function() pcall(function() player:RequestStreamAroundAsync(spawnPosition, 3) end) end)
+            refreshLists()
+        end
+        questPhase = "MATERIAL (" .. matName .. "): RENDERIZANDO " .. src.enemy
+        return
+    end
+    -- Se nenhum inimigo desse material esta carregado no cliente ainda, viaja ate o Quest Giver ou centro da ilha do material:
+    local giverPosition
+    if targetQuest then local npc; npc, giverPosition = questGiver(targetQuest) end
+    local islandPos = giverPosition or (island and islandPosition(island))
+    if ownRoot and islandPos then
+        local horizontal = (Vector3.new(ownRoot.Position.X, 0, ownRoot.Position.Z) - Vector3.new(islandPos.X, 0, islandPos.Z)).Magnitude
+        if horizontal > 180 or math.abs(ownRoot.Position.Y - islandPos.Y) > 250 then
+            if targetQuest and giverPosition then
+                beginTravel(giverPosition + Vector3.new(0, 5, 6), "Ilha " .. tostring(island) .. " (" .. matName .. ")", "farm", island)
+            else
+                beginTravel(islandPos + Vector3.new(0, 5, 0), "Ilha " .. tostring(island) .. " (" .. matName .. ")", "farm", island, true)
+            end
+            questPhase = "MATERIAL (" .. matName .. "): VIAJANDO PARA " .. tostring(island)
+            return
+        end
+        if os.clock() >= materialStreamAt then
+            materialStreamAt = os.clock() + 3
+            task.spawn(function() pcall(function() player:RequestStreamAroundAsync(islandPos, 3) end) end)
+            refreshLists()
+        end
+    end
+    questReady = true
+    questPhase = "MATERIAL (" .. matName .. "): AGUARDANDO SPAWN DE " .. src.enemy .. " EM " .. tostring(island)
+end
 local function updateQuest()
     questReady = false
     if state.bossMode then return end
+    if state.materialFarm then
+        quietQuestHUD(true)
+        if travel then questPhase = travel.phase .. ": " .. travel.label; return end
+        updateMaterialFarm()
+        return
+    end
     if not state.quests then questPhase = travel and (travel.phase .. ": " .. travel.label) or "Farm desligado"; return end
     quietQuestHUD(true)
     if travel then questPhase = travel.phase .. ": " .. travel.label; return end
@@ -1243,6 +1561,44 @@ local function updateQuest()
     questCooldown = os.clock() + 4
 end
 
+materialDropdown = farmSections.materials:AddDropdown("MaterialName", {Title = "Selecionar material", Values = {"Carregando..."}, Default = nil, Callback = function(value)
+    state.materialName, target = value, nil
+    if state.materialFarm and travel and travel.owner == "farm" then cancelTravel() end
+end})
+farmSections.materials:AddToggle("MaterialQuest", {Title = "Pegar missão junto com material", Default = true, Callback = function(value)
+    state.materialQuest = value ~= false
+end})
+materialControl = farmSections.materials:AddToggle("MaterialFarm", {Title = "Auto farm material", Default = false, Callback = function(value)
+    if value then
+        if storyController and storyController.active() then storyController.disable() end
+        if bossControl and bossControl.Value then bossControl:SetValue(false) end
+        if farmControl and farmControl.Value then farmControl:SetValue(false) end
+        local collect = Fluent.Options.CollectibleFarm
+        if collect and collect.Value then pcall(function() collect:SetValue(false) end) end
+        if Fluent.Options.EventSwordFarm and Fluent.Options.EventSwordFarm.Value then pcall(function() Fluent.Options.EventSwordFarm:SetValue(false) end) end
+        if Fluent.Options.SeaBeastFarm and Fluent.Options.SeaBeastFarm.Value then pcall(function() Fluent.Options.SeaBeastFarm:SetValue(false) end) end
+        if Fluent.Options.SeaBeastOnly and Fluent.Options.SeaBeastOnly.Value then pcall(function() Fluent.Options.SeaBeastOnly:SetValue(false) end) end
+        if Fluent.Options.FreeFly and Fluent.Options.FreeFly.Value then pcall(function() Fluent.Options.FreeFly:SetValue(false) end) end
+        if #materialNames == 0 then refreshMaterialCatalog() end
+        state.materialFarm, state.farm, state.attack, state.skills, state.quests, state.bossMode = true, true, true, true, true, false
+        quietQuestHUD(true)
+        guard("Noclip material", function() noclip.set("farm", true) end)
+        target, questReady, questPhase, nextCache = nil, false, "Iniciando farm de material", 0
+        currentLevel = readLevel()
+    else
+        if state.materialFarm then
+            state.materialFarm, state.farm, state.attack, state.skills, state.quests = false, false, false, false, false
+            guard("Restaurar noclip material", function() noclip.set("farm", false) end)
+            if travel and travel.owner == "farm" then cancelTravel() end
+            target, questNames, questReady, questPhase = nil, {}, false, "Farm desligado"
+        end
+    end
+end})
+farmSections.materials:AddButton({Title = "Atualizar materiais", Callback = function()
+    guard("Materiais", function() refreshQuestCatalog(true); refreshMaterialCatalog() end)
+end})
+task.spawn(function() guard("Catalogo inicial de materiais", function() refreshMaterialCatalog() end) end)
+
 local bossNames, bossPositions, bossListSignature = {}, {}, ""
 local function refreshBosses()
     local found, names = {}, {"mais próximo"}
@@ -1266,6 +1622,7 @@ end})
 bossControl = farmSections.boss:AddToggle("BossFarm", {Title = "Farm boss", Default = false, Callback = function(value)
     if value then
         if storyController and storyController.active()then storyController.disable()end
+        if materialControl and materialControl.Value then materialControl:SetValue(false) end
         guard("Pausar quests", function() farmControl:SetValue(false) end)
         local collect = Fluent.Options.CollectibleFarm
         if collect then guard("Pausar coleta", function() collect:SetValue(false) end) end
@@ -1331,6 +1688,16 @@ local serverHop = (function()
         if type(time)~="number"or os.time()-time>21600 then shared.visited[id]=nil end
     end
     shared.visited[game.JobId]=os.time()
+    local function isBrazil(location)
+        if type(location)~="string"then return false end
+        local country=location:match(",%s*([^,]+)%s*$")or location
+        country=country:lower():match("^%s*(.-)%s*$")
+        return country=="br"or country=="brazil"or country=="brasil"
+    end
+    local function nativeServers()
+        local r=game:GetService("ReplicatedStorage")
+        return require(r.Elysium.Modules.Library.ServerList).IsClient
+    end
     local busy, serial, pendingId, pendingSerial = false, 0, nil, nil
     local message = "Pronto para buscar"
     local panel = internalStatus({Title = "Busca de servidor", Content = message:upper()})
@@ -1400,18 +1767,30 @@ local serverHop = (function()
         if minPopulation and population<minPopulation then return false end
         return not shared.bad[server.id] or shared.bad[server.id] <= os.clock()
     end
-    local function start(maxPopulation,minPopulation)
+    local function start(maxPopulation,minPopulation,brazilOnly)
         if busy then status(pendingId and "Teleporte ja solicitado; aguarde" or "Busca em andamento; nao precisa clicar novamente"); return end
         busy, serial = true, serial + 1
         local ticket = serial
         task.spawn(function()
             local ok, err = xpcall(function()
+                local native=brazilOnly and nativeServers()or nil
                 local cursor, seen = "", {}
                 for page = 1, 5 do
                     if not running(ticket) then return end
                     local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder="..(minPopulation and "Desc"or "Asc").."&limit=100&excludeFullGames=true"
                     if cursor ~= "" then url = url .. "&cursor=" .. Http:UrlEncode(cursor) end
-                    local data = fetch(url, ticket)
+                    local data
+                    if brazilOnly then
+                        status("Consultando servidores brasileiros na lista do jogo")
+                        local list=native:GetActiveServers()
+                        assert(type(list)=="table","Lista nativa de servidores indisponivel")
+                        data={data={}}
+                        for _,entry in pairs(list)do
+                            if type(entry)=="table"and entry.PlaceId==game.PlaceId and isBrazil(entry.Location)then
+                                data.data[#data.data+1]={id=entry.JobId,playing=entry.Players,maxPlayers=entry.MaxPlayers,location=entry.Location}
+                            end
+                        end
+                    else data=fetch(url,ticket)end
                     if not data or not running(ticket) then return end
                     local candidates={}
                     for _,server in ipairs(data.data or {})do
@@ -1428,7 +1807,7 @@ local serverHop = (function()
                             guard("Pausar farm para teleporte", function() farmControl:SetValue(false) end)
                             local collectible = Fluent.Options.CollectibleFarm
                             if collectible then guard("Pausar coleta para teleporte", function() collectible:SetValue(false) end) end
-                            status("Entrando em servidor com " .. server.playing .. " pessoa(s) antes da sua entrada")
+                            status((brazilOnly and "Brasil | "..server.location.." | "or "").."Entrando em servidor com " .. server.playing .. " pessoa(s) antes da sua entrada")
                             shared.visited[server.id]=os.time()
                             if type(writefile)=="function"then
                                 pcall(writefile,"sowxteam-servidores.json",Http:JSONEncode({placeId=game.PlaceId,jobs=shared.visited}))
@@ -1448,7 +1827,7 @@ local serverHop = (function()
                     if type(nextCursor) ~= "string" or nextCursor == "" or seen[nextCursor] then break end
                     seen[nextCursor], cursor = true, nextCursor
                 end
-                status(minPopulation and "Nenhum servidor novo com 6 a 10 jogadores e vaga nas paginas consultadas"or "Nenhum servidor com 0 ou 1 pessoa nas paginas consultadas")
+                status(brazilOnly and "Nenhum servidor brasileiro com vaga; tente novamente depois"or minPopulation and "Nenhum servidor novo com 6 a 10 jogadores e vaga nas paginas consultadas"or "Nenhum servidor com 0 ou 1 pessoa nas paginas consultadas")
             end, function(value) return debug.traceback(tostring(value), 2) end)
             if serial == ticket and not pendingId then busy = false end
             if not ok and running(ticket) then
@@ -1470,6 +1849,7 @@ local serverHop = (function()
         pendingId, pendingSerial, busy = nil, nil, false
         status("Teleporte recusado: " .. tostring(reason) .. ". Tente novamente para outro candidato")
     end))
+    tabs.server:AddButton({Title="Hop servidor Brasil",Callback=function()start(nil,nil,true)end})
     tabs.server:AddButton({Title = "Servidor com até 1 pessoa", Callback = function() start(1) end})
     tabs.server:AddButton({Title = "Trocar servidor publico", Callback = function()
         guard("Troca de servidor publico",function()
@@ -1485,7 +1865,7 @@ local playerVisuals = {}
 local METERS_PER_STUD = 0.28
 local function removePlayerVisual(other)
     local entry = playerVisuals[other]
-    if entry then entry.highlight:Destroy(); entry.gui:Destroy(); playerVisuals[other] = nil end
+    if entry then entry.highlight:Destroy(); entry.gui:Destroy(); if entry.anchor then entry.anchor:Destroy()end; playerVisuals[other] = nil end
 end
 local function updatePlayerESP()
     local _, _, ownRoot = character()
@@ -1501,19 +1881,22 @@ local function updatePlayerESP()
             local c = other.Character
             local root = c and c:FindFirstChild("HumanoidRootPart")
             local hum = c and c:FindFirstChildOfClass("Humanoid")
-            local distance = root and (root.Position - ownRoot.Position).Magnitude * METERS_PER_STUD or math.huge
-            if root and hum and hum.Health > 0 and distance <= state.playerEspDistance then
+            local serverPosition=other:GetAttribute("ServerPosition")
+            local position=root and root.Position or(typeof(serverPosition)=="Vector3"and serverPosition or nil)
+            local distance=position and(position-ownRoot.Position).Magnitude*METERS_PER_STUD
+            if position and(not hum or hum.Health>0)then
                 local entry = playerVisuals[other]
                 if not entry then
                     local h = Instance.new("Highlight")
                     h.Name, h.Adornee = "SOWxTEAMPlayerESP", c
+                    h.Enabled = c ~= nil
                     h.FillColor, h.OutlineColor = Color3.fromRGB(174, 115, 255), Color3.fromRGB(240, 225, 255)
                     h.FillTransparency, h.DepthMode = 0.8, Enum.HighlightDepthMode.AlwaysOnTop
-                    h.Parent = c
+                    h.Parent = player:WaitForChild("PlayerGui")
                     local gui = Instance.new("BillboardGui")
-                    gui.Name, gui.Adornee, gui.AlwaysOnTop = "SOWxTEAMPlayerLabel", c:FindFirstChild("Head") or root, true
+                    gui.Name, gui.Adornee, gui.AlwaysOnTop = "SOWxTEAMPlayerLabel", c and(c:FindFirstChild("Head")or root)or nil, true
                     gui.Size, gui.StudsOffset = UDim2.fromOffset(220, 45), Vector3.new(0, 3, 0)
-                    gui.MaxDistance = state.playerEspDistance / METERS_PER_STUD
+                    gui.MaxDistance = 0
                     gui.Parent = player:WaitForChild("PlayerGui")
                     local text = Instance.new("TextLabel")
                     text.Size, text.BackgroundTransparency = UDim2.fromScale(1, 1), 1
@@ -1523,8 +1906,22 @@ local function updatePlayerESP()
                     entry = {character = c, highlight = h, gui = gui, text = text}
                     playerVisuals[other] = entry
                 end
-                entry.gui.MaxDistance = state.playerEspDistance / METERS_PER_STUD
-                entry.text.Text = other.DisplayName .. "\n" .. math.floor(distance + 0.5) .. " m | HP " .. math.ceil(hum.Health)
+                entry.gui.MaxDistance=0
+                entry.highlight.Adornee=c
+                entry.highlight.Enabled=c~=nil
+                if root then
+                    entry.gui.Adornee=c:FindFirstChild("Head")or root
+                    if entry.anchor then entry.anchor:Destroy();entry.anchor=nil end
+                else
+                    if not entry.anchor then
+                        local anchor=Instance.new("Part");anchor.Name="SOWxPlayerESPPosition"
+                        anchor.Anchored=true;anchor.CanCollide=false;anchor.CanTouch=false;anchor.CanQuery=false
+                        anchor.Transparency=1;anchor.Size=Vector3.new(.1,.1,.1);anchor.Parent=workspace
+                        entry.anchor=anchor
+                    end
+                    entry.anchor.Position=position;entry.gui.Adornee=entry.anchor
+                end
+                entry.text.Text=other.DisplayName.."\n"..math.floor(distance+.5).." m | HP "..(hum and tostring(math.ceil(hum.Health))or "?")
             else removePlayerVisual(other) end
         end
     end
@@ -1622,10 +2019,11 @@ local collectibleFarm = (function()
         guard("Noclip de colecionaveis", function() noclip.set("collectibles", value) end)
         if travel and travel.owner == "collectibles" then cancelTravel() end
         active, targetItem, retries, lastScan = value, nil, 0, 0
-        islandIndex, visited, missing, visitDeadline, round, contextSince = 1, {}, {}, 0, 1, 0
+        islandIndex, visited, missing, visitDeadline, round, contextSince, includeUnloaded = 1, {}, {}, 0, 1, 0, false
         seenIslands = {}
         if value then
             if bossControl and bossControl.Value then bossControl:SetValue(false) end
+            if materialControl and materialControl.Value then materialControl:SetValue(false) end
             state.farm, state.attack, state.skills, state.quests = false, false, false, false
             target = nil
             guard("Desligar seletor de combate", function() farmControl:SetValue(false) end)
@@ -1656,9 +2054,9 @@ local collectibleFarm = (function()
         if not hum or hum.Health <= 0 or not ownRoot then setPhase("Aguardando personagem"); return end
         local island = chosenIsland ~= "todas as ilhas" and chosenIsland or islands[islandIndex]
         if not island or visited[island] then
-            if round == 1 and next(blocked) then
-                round, islandIndex, visited, visitDeadline, lastScan = 2, 1, {}, 0, 0
-                setPhase("Segunda passagem: tentando novamente os itens bloqueados")
+            if round == 1 and (next(blocked) or #missing > 0) then
+                round, islandIndex, visited, visitDeadline, lastScan, includeUnloaded = 2, 1, {}, 0, 0, true
+                setPhase("Segunda passagem: tentando novamente os itens bloqueados e seeds")
                 return
             end
             local pendingCount, confirmedCount = 0, 0
@@ -1794,7 +2192,7 @@ local movementExtras = (function()
     local nextProperties, touchJumpUntil = 0, 0
     local sections = {
         move = tabs.others:AddSection("Velocidade"),
-        jump = tabs.others:AddSection("Pulos"),
+        jump = tabs.others:AddSection("Super Humano"),
         fly = tabs.others:AddSection("Voo e noclip"),
     }
     local function setProperty(humanoid, name, value)
@@ -1892,10 +2290,82 @@ local movementExtras = (function()
         end
     end))
     table.insert(connections,RS.Heartbeat:Connect(function() if state.alive then guard("Movimento manual",step) end end))
-    return {stop=restoreAll}
+    return {stop=restoreAll,jumpSection=sections.jump}
+end)()
+
+local dashExtras=(function()
+    local enabled=false
+    local network,originalFire,wrapper,option,panel
+    local lastDashAt=-math.huge
+    local nextStatus=0
+    local observedReverts=tonumber(player:GetAttribute("AntiTeleportReverts"))or 0
+    local info={enabled=false,phase="DESLIGADO",dashes=0}
+    local function stop()
+        enabled=false;state.infiniteDash=false;info.enabled=false
+        if network and wrapper and network.FireServer==wrapper then network.FireServer=originalFire end
+        network=nil;originalFire=nil;wrapper=nil
+        info.phase="DESLIGADO"
+    end
+    local function set(value)
+        stop()
+        if not value then return end
+        local ok,err=pcall(function()
+            local currentNetwork=clientAPI().Network
+            local previous=currentNetwork.FireServer
+            assert(type(previous)=="function","Metodo de mobilidade indisponivel")
+            local wrapped
+            wrapped=function(self,...)
+                local args=table.pack(...)
+                if enabled and state.alive and self==currentNetwork
+                    and args[1]=="Mobility"and args[2]=="CallContext"and args[3]=="Dash"
+                    and args[4]==player.Character then
+                    local _,hum=character()
+                    if hum and hum.Health>0 then
+                        lastDashAt=os.clock();info.dashes=info.dashes+1
+                        info.energyBefore=hum:GetAttribute("Energy")
+                        info.phase="DASH NATIVO SEM AVISO DE CONSUMO"
+                        return
+                    end
+                end
+                return previous(self,...)
+            end
+            network=currentNetwork;originalFire=previous;wrapper=wrapped
+            network.FireServer=wrapper
+            enabled=true;state.infiniteDash=true;info.enabled=true;info.error=nil
+            observedReverts=tonumber(player:GetAttribute("AntiTeleportReverts"))or 0
+            info.phase="ATIVO: USE O DASH NORMAL"
+        end)
+        if not ok then
+            stop();info.error=tostring(err);info.phase="ERRO AO ATIVAR"
+            notify("Dash sem stamina: "..tostring(err))
+            if option and option.Value then option:SetValue(false)end
+        end
+    end
+    local section=movementExtras.jumpSection
+    option=section:AddToggle("InfiniteDash",{Title="Dash Infinito",Default=false,Callback=set})
+    table.insert(connections,RS.Heartbeat:Connect(function()
+        if not state.alive then if enabled then stop()end;return end
+        if os.clock()<nextStatus then return end
+        nextStatus=os.clock()+.25
+        if enabled then
+            local _,hum=character()
+            info.energy=hum and hum:GetAttribute("Energy")
+            local reverts=tonumber(player:GetAttribute("AntiTeleportReverts"))or observedReverts
+            if reverts>observedReverts and os.clock()-lastDashAt<2.5 and not state.farm and not travel then
+                if option then option:SetValue(false)else stop()end
+                info.phase="INTERROMPIDO: CORRECAO DE POSICAO APOS DASH"
+                notify("Dash sem stamina pausado: o jogo corrigiu a posicao apos o dash.")
+            end
+            observedReverts=reverts
+        end
+        if panel then pcall(function()panel:SetDesc(info.phase)end)end
+    end))
+    return {stop=stop,debug=function()return info end}
 end)()
 
 local function stop()
+    dashExtras.stop()
+    if eventSwordController then eventSwordController.stop()end
     if seaBeastController then seaBeastController.stop()end
     if env.SOWxFruitController then env.SOWxFruitController.stop()end
     if bossGuardian then bossGuardian.stop()end
@@ -2068,9 +2538,6 @@ local function restoreInterface(closeMenus)
     end)
     return ok,message
 end
-tabs.settings:AddButton({Title="Restaurar interface",Callback=function()
-    guard("Restaurar interface",function()local ok,message=restoreInterface(true);assert(ok,message)end)
-end})
 local themes = Fluent.Themes or {"Dark", "Amethyst"}
 tabs.settings:AddDropdown("Theme", {Title = "Tema", Values = themes, Default = "Amethyst", Callback = function(v) Fluent:SetTheme(v) end})
 do
@@ -2133,18 +2600,18 @@ local function stableCombatPosition(enemyRoot)
             if best then movementOffset=best;state.combatPositionBlocked=false
             else
                 state.combatPositionBlocked=true
-                return root and root.Position or selected
+                movementOffset=Vector3.new(0,math.max(6,state.distance+state.height),0)
             end
         else state.combatPositionBlocked=false end
-    end
-    if state.combatPositionBlocked then
-        local _,_,root=character()
-        if root then return root.Position end
     end
     return enemyRoot.Position+movementOffset
 end
 table.insert(connections, RS.Heartbeat:Connect(function(dt)
     if not state.alive or Fluent.Unloaded then return end
+    if eventSwordController and eventSwordController.blocked()then
+        if travel and travel.owner=="boss"then cancelTravel()end
+        return
+    end
     if travel then guard("Travessia", function() stepTravel(dt) end); return end
     if not state.farm then return end
     guard("Movimento", function()
@@ -2155,8 +2622,18 @@ table.insert(connections, RS.Heartbeat:Connect(function(dt)
         local enemyRoot = target.HumanoidRootPart
         local position=stableCombatPosition(enemyRoot)
         if (position - root.Position).Magnitude > 100 then
-            if storyController and storyController.active()then return end
-            beginTravel(position, "ALVO DE FARM", state.bossMode and "boss" or "farm", state.bossMode and locateIsland(enemyRoot.Position) or (desiredQuest and desiredQuest.island))
+            if storyController and storyController.active()then
+                local delta = position - root.Position
+                local step = (state.travelSpeed or 270) * math.min(dt, 0.1)
+                if delta.Magnitude > step then position = root.Position + delta.Unit * step end
+                root.CFrame = CFrame.lookAt(position, enemyRoot.Position)
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+                return
+            end
+            local matSrc = state.materialFarm and materialCatalog[state.materialName] and chooseMaterialSource(materialCatalog[state.materialName], currentLevel)
+            local destIsland = state.bossMode and locateIsland(enemyRoot.Position) or (matSrc and matSrc.island) or (desiredQuest and desiredQuest.island) or locateIsland(enemyRoot.Position)
+            beginTravel(position, "ALVO DE FARM", state.bossMode and "boss" or "farm", destIsland)
             return
         end
         local delta = position - root.Position
@@ -2347,6 +2824,7 @@ storyController=(function()
     local catalog,historyNames={},{}
     local allDefinitions,auxiliaries,knownActives={}, {},nil
     local eventQuest
+    local eventLearned
     local eventRequestSerial=0
     local lastStoryInteraction
     local modules,types,interaction,questSystem,locks
@@ -2356,7 +2834,6 @@ storyController=(function()
     local noActiveSince
     local info={phase=phase,chapter="",objective="",catalog=0,confirmedSteps=0,resets=0}
     local panel=internalStatus({Title="Modo história",Content=phase})
-    local section=farmSections.story
     local storyToggle
     local fishingToggle,fishingMode,fishingPoint=nil,false,nil
     local activeDialogue,dialogueUI,originalNew,newWrapper,visibilityConnection
@@ -2512,10 +2989,11 @@ storyController=(function()
     local function nextObjective(data)
         local actives=data.Quests and data.Quests.Actives or {}
         local names={}
-        for name in pairs(auxiliaries)do if actives[name]then names[#names+1]=name end end
+        for name in pairs(auxiliaries)do if actives[name]and(not eventQuest or name==eventQuest.quest)then names[#names+1]=name end end
         table.sort(names)
         if chapter and catalog[chapter] and actives[chapter] then names[#names+1]=chapter end
         for _,name in ipairs(historyNames)do if actives[name] and name~=chapter then names[#names+1]=name end end
+        if eventQuest then names=actives[eventQuest.quest]and{eventQuest.quest}or{}end
         for _,name in ipairs(names)do
             local definition=catalog[name]or allDefinitions[name]
             local progress=actives[name]
@@ -3822,8 +4300,9 @@ storyController=(function()
             cruiseHeight=altitude
             points[#points+1]=Vector3.new(root.Position.X,altitude,root.Position.Z)
             points[#points+1]=Vector3.new(point.X,altitude,point.Z)
-        elseif eventQuest and gap>300 and not indoors then
-            local altitude=math.max(30/0.28,root.Position.Y,point.Y+8)
+        elseif eventQuest and gap>180 and not indoors then
+            local clearance=math.max(115,30/0.28)
+            local altitude=cruiseHeight and math.max(cruiseHeight,point.Y+clearance)or math.max(root.Position.Y,point.Y)+clearance
             cruiseHeight=altitude
             points[#points+1]=Vector3.new(root.Position.X,altitude,root.Position.Z)
             points[#points+1]=Vector3.new(point.X,altitude,point.Z)
@@ -4152,6 +4631,7 @@ storyController=(function()
         if route then route.last=nextPosition end
     end
     objectiveNPCs={
+        Talk_SkyHermitSummit="Sky Hermit Summit",Talk_MysteriousMonk_SQ="Mysterious Monk",
         ["Talk_FlameMasterRun_FS"]="Flame Master",
         ["Talk_FlameMasterDrills_FS"]="Flame Master",
         ["Talk_FlameMasterReady_FS"]="Flame Master",
@@ -4360,8 +4840,67 @@ storyController=(function()
         return groundedStand(stand,npc)
     end
     local function nativeRouteContext(obj,engine,point,node,root)
-        if not obj or not root or not point or not node or typeof(node)~="Instance"then return nil end
+        if not obj or not root or not point or not node then return nil end
         if info.routeSource~="ROTA NATIVA"then return nil end
+        if obj.ObjectiveID=="Activate_HeavenstepCheckpoints"then
+            local name=typeof(node)=="Instance"and node.Name or type(node)=="string"and node or nil
+            local index=type(name)=="string"and tonumber(name:match("^Checkpoint_Heavenstep Mountain_(%d+)$"))
+            local context=engine.Contexts.Checkpoints
+            if not index or index<1 or index>7 or type(context)~="table"or(point-root.Position).Magnitude>8 then return nil end
+            local highlight=context.HighlightParent
+            if typeof(highlight)~="Instance"then return nil end
+            local ignore=workspace:FindFirstChild("IgnoreList")
+            local int=ignore and ignore:FindFirstChild("Int")
+            local parkour=int and int:FindFirstChild("Parkour")
+            local mountain=parkour and parkour:FindFirstChild("Heavenstep Mountain")
+            if not mountain or not highlight:IsDescendantOf(mountain)then return nil end
+            local ok,checkpoints=pcall(function()
+                local settings=require(game:GetService("ReplicatedStorage").Shared.MainModules.Modes.ParkourSettings)
+                return settings.GetCheckpoints(mountain)
+            end)
+            if not ok or type(checkpoints)~="table"then return nil end
+            for _,checkpoint in ipairs(checkpoints)do
+                local flag=checkpoint.Flag
+                if tonumber(checkpoint.Number)==index and typeof(flag)=="Instance"
+                    and(flag==highlight or flag:IsDescendantOf(highlight)or highlight:IsDescendantOf(flag))then
+                    info.checkpoint={index=index,context="Checkpoints",source="NATIVE_PARKOUR_FLAG"}
+                    return "Checkpoints"
+                end
+            end
+            return nil
+        end
+        if typeof(node)~="Instance"then return nil end
+        local leverIndex=tonumber(obj.ObjectiveID:match("^Pull_PhantomLever_SQ_(%d+)$"))
+        local templeParts={Enter_PhantomRuins_SQ={key="TempleRunEnter",part="TeleportEntryPart"},
+            Take_PhantomTablet_SQ={key="TempleRunTablet",part="SoruTabulet"},
+            Escape_PhantomRuins_SQ={key="TempleRunLeave",part="TeleportBackPart"}}
+        local temple=templeParts[obj.ObjectiveID]
+        if leverIndex or temple then
+            if(point-root.Position).Magnitude>8 then return nil end
+            local map=workspace:FindFirstChild("Map");local areas=map and map:FindFirstChild("Areas")
+            local dunes=areas and areas:FindFirstChild("Golden Dunes")
+            local minigame=dunes and dunes:FindFirstChild("SoruMiniGame")
+            local quest=minigame and minigame:FindFirstChild("Quest")
+            if not quest or not node:IsDescendantOf(quest)then return nil end
+            local key
+            if leverIndex then
+                local levers=quest:FindFirstChild("Levers")
+                if leverIndex<1 or leverIndex>3 or not levers or not node:IsDescendantOf(levers)
+                    or tonumber(node:GetAttribute("Index"))~=leverIndex then return nil end
+                key="TempleRunLever_"..leverIndex
+            else
+                if node~=quest:FindFirstChild(temple.part)then return nil end
+                key=temple.key
+            end
+            local context=engine.Contexts[key]
+            if type(context)~="table"then return nil end
+            local highlight=context.HighlightParent
+            if leverIndex or key=="TempleRunTablet"then
+                if typeof(highlight)~="Instance"or not(node==highlight or node:IsDescendantOf(highlight)or highlight:IsDescendantOf(node))then return nil end
+            end
+            info.templeContext={objective=obj.ObjectiveID,context=key,source="NATIVE_SORU_QUEST"}
+            return key
+        end
         local carryContext=engine.Contexts["Carry Chest"]
         if type(carryContext)=="table"and(point-root.Position).Magnitude<=10 then
             local function ownedChest(object)
@@ -4446,7 +4985,7 @@ storyController=(function()
         local routeContext=nativeRouteContext(obj,engine,point,node,interactionRoot)
         if routeContext then
             key=routeContext
-            info.nativeInteraction={objective=obj.ObjectiveID,context=key,source=node and key==node.Name and "EXACT_NATIVE_ROUTE_KEY"or "EXACT_NATIVE_ZONE"}
+            info.nativeInteraction={objective=obj.ObjectiveID,context=key,source=key:match("^TempleRun")and "EXACT_NATIVE_SORU_OBJECT"or obj.ObjectiveID=="Activate_HeavenstepCheckpoints"and "EXACT_NATIVE_CHECKPOINT"or node and key==node.Name and "EXACT_NATIVE_ROUTE_KEY"or "EXACT_NATIVE_ZONE"}
         end
         local candidate=obj and (engine.Contexts[obj.ObjectiveID]and obj.ObjectiveID
             or obj.ObjectiveID:match("^Dig_")and engine.Contexts["Dig Treasure"]and "Dig Treasure"
@@ -4503,6 +5042,9 @@ storyController=(function()
         if privateArea~=nil then
             relatedRoute=true
             info.entryArea=tostring(privateArea)
+        end
+        if not relatedRoute and (key=="Enter Area"or key=="Leave Area")and info.routeSource=="ROTA NATIVA"and point and (root.Position-point).Magnitude<=8 and engine.CurrentContext==key then
+            relatedRoute=true
         end
         -- A nearby exit is not evidence that this objective needs that exit.
         if gate and not relatedRoute then return false end
@@ -4578,9 +5120,15 @@ storyController=(function()
             info.interactionContract={context=key,objective=obj and obj.ObjectiveID,reachable=true,focus=focus:GetFullName()}
             route=nil;noclip.set("story",false)
             local _,hum=character()
-            if animationPlaying()or (hum and hum.FloorMaterial and hum.FloorMaterial==Enum.Material.Air)then
-                setPhase("AGUARDANDO APOIAR NO CHAO / TERMINAR ANIMACAO");return true
+            if animationPlaying()then
+                setPhase("AGUARDANDO TERMINAR ANIMACAO");return true
             end
+            if hum and hum.FloorMaterial and hum.FloorMaterial==Enum.Material.Air then
+                info.airWait=info.airWait and info.airWait.key==key and info.airWait or {key=key,since=os.clock()}
+                if os.clock()-info.airWait.since<2.5 then
+                    setPhase("AGUARDANDO APOIAR NO CHAO");return true
+                end
+            else info.airWait=nil end
         end
         if obj and key==obj.ObjectiveID and obj.ObjectiveID:match("^Remove_MuralCover_SL_%d+$")then
             local approach,_,scenery=muralTarget(obj)
@@ -4647,8 +5195,11 @@ storyController=(function()
             local _,hum=character()
             local needsGround=not gate and not transport and privateArea==nil
             if needsGround and hum and hum.FloorMaterial and hum.FloorMaterial==Enum.Material.Air then
-                setPhase("AGUARDANDO APOIAR NO CHAO PARA SEGURAR / CAVAR");return true
-            end
+                info.holdAirWait=info.holdAirWait and info.holdAirWait.key==key and info.holdAirWait or {key=key,since=os.clock()}
+                if os.clock()-info.holdAirWait.since<2.5 then
+                    setPhase("AGUARDANDO APOIAR NO CHAO PARA SEGURAR / CAVAR");return true
+                end
+            else info.holdAirWait=nil end
             if heldInteraction then return true end
             local session={key=key,at=os.clock(),duration=duration,root=root,token=objectiveToken}
             heldInteraction=session;lastAction=os.clock();lastStoryInteraction=lastAction
@@ -4674,7 +5225,7 @@ storyController=(function()
                     cargoReleased={id=obj.ObjectiveID,at=os.clock()}
                 end
                 if privateArea~=nil and (not privateAreasClient or privateAreasClient.Current~=privateArea)then return end
-                if gate or transport or nativeTransitionNode(node)then
+                if gate or transport or nativeTransitionNode(node)or key=="TempleRunEnter"or key=="TempleRunLeave"then
                     pendingTransition={location=player:GetAttribute("CurrentLocation"),position=currentRoot.Position,at=os.clock(),key=key,transport=transport or tostring(privateArea):find("SkyLift",1,true)~=nil};route=nil
                 end
                 lastAction=os.clock();engine.Interacted:Fire(key)
@@ -4883,11 +5434,13 @@ storyController=(function()
             attempt={fingerprint=fingerprint,count=0,at=-math.huge};dialogueAttempts[converse]=attempt
         end
         trace.attempts=attempt.count;trace.selected=best;info.dialogue=trace
-        if os.clock()-attempt.at<2 then return true end
+        if os.clock()-attempt.at<1.25 then return true end
         if attempt.count>=3 then
             info.dialogueBlocked="RESPOSTA SEM MUDANCA DE SEGMENTO APOS 3 TENTATIVAS"
+            pcall(function()if type(converse.End)=="function"then converse:End()end end)
+            activeDialogue=nil;dialogueAttempts[converse]=nil;lastAction=0;resumeAfter=os.clock()+0.8
             if dialogueUI then dialogueUI.Visible=true end
-            setPhase("DIALOGO SEM CONFIRMACAO; DETALHES NO REGISTRO");return true
+            setPhase("DIALOGO TRAVADO; FECHANDO E REABRINDO COM O NPC");return true
         end
         if not best and #options>0 or best and bestScore<=0 then
             info.dialogueBlocked="SEM OPCAO DE PROGRESSAO IDENTIFICADA"
@@ -6069,11 +6622,10 @@ storyController=(function()
         if type(data)~="table" or type(data.Quests)~="table"then setPhase("AGUARDANDO DADOS DA HISTORIA");return end
         if eventQuest then
             local event=eventQuest
-            local mastery=data.Tools and data.Tools.Mastery
-            if mastery and mastery[event.style]~=nil then
+            if eventLearned(data,event)then
                 stopStory()
                 pcall(function()storyToggle:SetValue(false)end)
-                setPhase("ESTILO APRENDIDO: "..event.style);notify("Estilo aprendido: "..event.style);return
+                setPhase("APRENDIDO: "..event.style);notify("Aprendido: "..event.style);return
             end
             if not(data.Quests.Actives and data.Quests.Actives[event.quest])then
                 info.chapter=event.quest;info.objective="Conversar com o mestre";info.eventQuest=event.quest
@@ -6088,6 +6640,9 @@ storyController=(function()
                             return assets.QuestZone("Rustfall","Enter_KeeperHouse_FS")
                         end
                         return compass.Route("Storm Keeper's House",compass.Npc(event.npc))()
+                    elseif event.quest=="Vox Sense Training"or event.quest=="Vox Armor Training"then
+                        local compass=require(game:GetService("ReplicatedStorage").Shared.MainModules.ProgressUtils.QuestsInfo.SkylandsCompass)
+                        return compass.Route("Windhaven",compass.Npc(event.npc))()
                     end
                     local points=types.InterestPoints or require(game:GetService("ReplicatedStorage").Shared.MainModules.OtherUtils.InterestPoints)
                     local value=points:Get("Character_"..event.npc)
@@ -6131,6 +6686,11 @@ storyController=(function()
         if timedQuestCooldown(obj,sub)then return end
         if name then currentObjective=obj end
         info.lastProgressAge=math.floor(os.clock()-lastProgress)
+        if not name and eventQuest then
+            stopCombat();route=nil
+            if dialogue()then return end
+            setPhase("EVENTO: AGUARDANDO CONFIRMACAO DO DESBLOQUEIO NO SERVIDOR");return
+        end
         if not name then
             stopCombat();route=nil
             if dialogue()then return end
@@ -6145,15 +6705,12 @@ storyController=(function()
             local audit=auditHistoryCompletion()
             local inactive=inactiveHistoryState()
             if audit.total>0 and audit.completed==audit.total then
-                inactive="HISTORIA CONCLUIDA: "..tostring(audit.completed).."/"..tostring(audit.total).." CAPITULOS"
+                inactive="Você terminou todas as missões no momento."
             elseif #audit.unknown==0 then
-                inactive="SEM HISTORIA ATIVA: "..tostring(audit.completed).."/"..tostring(audit.total).." CONCLUIDOS; "..tostring(#audit.pending).." NAO CONCLUIDOS"
+                inactive="Você terminou todas as missões no momento."
             end
             if info.inactiveHistory~=inactive then
                 info.inactiveHistory=inactive;recordStoryEvent("sem_missao_ativa",inactive)
-                if info.completion and info.completion.confirmed then
-                    pcall(notify,"CAPITULO CONCLUIDO: "..info.completion.chapter..". SEM NOVA MISSAO DE HISTORIA ATIVA.")
-                end
             end
             local ordinary={}
             for questName in pairs(data.Quests.Actives or {})do
@@ -6162,9 +6719,7 @@ storyController=(function()
             table.sort(ordinary);audit.ordinaryActive=ordinary
             if storyToggle and storyToggle.Value then
                 storyToggle:SetValue(false)
-                local reason=inactive
-                if #ordinary>0 then reason=reason..". FARM NORMAL ATIVO NO JOGO: "..table.concat(ordinary,", ")end
-                pcall(notify,reason)
+                pcall(notify,"Você terminou todas as missões no momento.")
             end
             setPhase(inactive)
             return
@@ -6286,7 +6841,10 @@ storyController=(function()
                     setPhase("SUPRIMENTOS: SEGUINDO POSICAO CONFIRMADA PELO SERVIDOR");return
                 end
                 route=nil;noclip.set("story",false);hum:MoveTo(root.Position)
-                if hum.FloorMaterial==Enum.Material.Air then setPhase("SUPRIMENTOS: AGUARDANDO APOIAR NO CHAO");return end
+                if hum.FloorMaterial==Enum.Material.Air and os.clock()-(recovery.waitSince or os.clock())<3 then
+                    recovery.waitSince=recovery.waitSince or os.clock()
+                    setPhase("SUPRIMENTOS: AGUARDANDO APOIAR NO CHAO");return
+                end
                 if os.clock()>=recovery.nextAt and recovery.attempts<3 then
                     recovery.nextAt=os.clock()+3;recovery.attempts=recovery.attempts+1
                     pcall(function()
@@ -6503,9 +7061,10 @@ storyController=(function()
                 if location~="Open World"then
                     combatAnchor={token=objectiveToken,location=location,point=enemyPart.Position}
                 end
-                if (root.Position-enemyPart.Position).Magnitude>70 then
+                local distance=(root.Position-enemyPart.Position).Magnitude
+                if distance>22 and not (state.attack and target==enemy) then
                     stopCombat()
-                    navigate(enemyPart.Position+Vector3.new(0,3,6),enemyPart,obj)
+                    navigate(enemyPart.Position+Vector3.new(0,3,5),enemyPart,obj)
                     setPhase("APROXIMANDO DO INIMIGO: "..enemyName);return
                 end
                 if travel and (travel.owner=="farm"or travel.owner=="boss")then cancelTravel()end
@@ -6548,18 +7107,32 @@ storyController=(function()
             if interact(obj,false,point,enemyName,node)then return end
             setPhase("AGUARDANDO ROTA NATIVA / OBJETIVO CARREGAR")
         end
-        if os.clock()-lastProgress>45 then setPhase("ETAPA SEM PROGRESSO: "..obj.ObjectiveID.."; AGUARDANDO INTERACAO / MECANICA ESPECIFICA")end
+        if os.clock()-lastProgress>45 then
+            if os.clock()-lastProgress>55 then
+                route=nil;npcHold=nil;zoneApproach=nil;regionGoal=nil;combatAnchor=nil;arrivalRecovery=nil;actionWait=nil
+                approachCache=setmetatable({},{__mode="k"})
+                lastProgress=os.clock()-15
+                if point then task.spawn(function()pcall(function()player:RequestStreamAroundAsync(point,3)end)end)end
+                setPhase("ETAPA SEM PROGRESSO: "..obj.ObjectiveID.."; RECALCULANDO ROTA E CACHES")
+            else
+                setPhase("ETAPA SEM PROGRESSO: "..obj.ObjectiveID.."; AGUARDANDO INTERACAO / MECANICA ESPECIFICA")
+            end
+        end
     end
-    storyToggle=section:AddToggle("StoryFarm",{Title="Farm história",Default=false,Callback=function(value)
+    local function setStory(value)
         if not value then stopStory();return end
         if fishingMode then stopStory()end
-        farmControl:SetValue(false)
-        if bossControl then bossControl:SetValue(false)end
-        if Fluent.Options.CollectibleFarm then Fluent.Options.CollectibleFarm:SetValue(false)end
-        if Fluent.Options.FreeFly then Fluent.Options.FreeFly:SetValue(false)end
+        if materialControl and materialControl.Value then materialControl:SetValue(false)end
+        if bossControl and bossControl.Value then bossControl:SetValue(false)end
+        if Fluent.Options.CollectibleFarm and Fluent.Options.CollectibleFarm.Value then Fluent.Options.CollectibleFarm:SetValue(false)end
+        if Fluent.Options.FreeFly and Fluent.Options.FreeFly.Value then Fluent.Options.FreeFly:SetValue(false)end
         cancelTravel();stopCombat()
         local ready=guard("Catalogo da historia",loadCatalog)
-        if not ready then if storyToggle then storyToggle:SetValue(false)end;return end
+        if not ready then
+            if storyToggle then storyToggle.Value=false end
+            if farmControl and farmControl.Value and state.farmMode=="História" then farmControl:SetValue(false) end
+            return
+        end
         local initialData=modules.DataStore.IsClient:Get()
         knownActives={};for name in pairs(initialData and initialData.Quests and initialData.Quests.Actives or {})do knownActives[name]=true end
         info.cooldown=nil;info.cooldownRemaining=nil
@@ -6570,7 +7143,17 @@ storyController=(function()
         lastAnswered=nil;lastSegment=nil;lastButton=nil;lastAction=0;resumeAfter=0
         lastSignature="";lastProgress=os.clock();noActiveSince=nil;nextCache=0
         noclip.set("story",true);setPhase("LENDO PROGRESSO SALVO DA HISTORIA")
-    end})
+        if storyToggle then storyToggle.Value=true end
+    end
+    storyToggle={Value=false,SetValue=function(self,v)
+        v=not not v
+        self.Value=v
+        if not v and farmControl and farmControl.Value and state.farmMode=="História" and not eventQuest then
+            pcall(function()farmControl:SetValue(false)end)
+        end
+        setStory(v)
+    end}
+    Fluent.Options.StoryFarm=storyToggle
     fishingToggle=farmSections.fishing:AddToggle("FishingFarm",{Title="Farm pesca",Default=false,Callback=function(value)
         if not value then
             if fishingMode then stopStory()end
@@ -6578,6 +7161,7 @@ storyController=(function()
         end
         if storyToggle.Value then storyToggle:SetValue(false)end
         farmControl:SetValue(false)
+        if materialControl and materialControl.Value then materialControl:SetValue(false)end
         if bossControl then bossControl:SetValue(false)end
         if Fluent.Options.CollectibleFarm then Fluent.Options.CollectibleFarm:SetValue(false)end
         if Fluent.Options.FreeFly then Fluent.Options.FreeFly:SetValue(false)end
@@ -6590,7 +7174,10 @@ storyController=(function()
         route=nil;npcHold=nil;pendingTransition=nil;manualShop=nil
         setPhase("PESCA: PREPARANDO VARA NA POSICAO ATUAL")
     end})
-    reliableToggle(storyToggle)
+    eventLearned=function(data,event)
+        if event.ability then return(tonumber(data.Abilitys and data.Abilitys[event.ability])or 0)>0 end
+        return data.Tools and data.Tools.Mastery and data.Tools.Mastery[event.style]~=nil
+    end
     local function startStyleEvent(event)
         assert(type(event)=="table"and type(event.quest)=="string"and type(event.npc)=="string","Evento inválido")
         if enabled then
@@ -6605,8 +7192,13 @@ storyController=(function()
         assert(definition,"Missão de estilo indisponível no jogo")
         local data=modules.DataStore.IsClient:Get()
         assert(type(data)=="table","Dados do personagem ainda indisponíveis")
-        if data.Tools and data.Tools.Mastery and data.Tools.Mastery[event.style]~=nil then
-            notify("Estilo já aprendido: "..event.style);return false
+        if eventLearned(data,event)then notify("Ja aprendido: "..event.style);return false end
+        if event.requiresAbility and(tonumber(data.Abilitys and data.Abilitys[event.requiresAbility])or 0)<=0 then
+            notify("Aprenda Haki da Observacao antes do Haki do Armamento.");return false
+        end
+        if event.price then
+            local gold=data.Statistics and tonumber(data.Statistics.Gold)
+            if gold and gold<event.price then notify("O treinamento exige "..event.price.." moedas.");return false end
         end
         local required=tonumber(definition.MinLevel)
         local level=data.Statistics and tonumber(data.Statistics.Level)
@@ -6620,15 +7212,26 @@ storyController=(function()
         if not(data.Quests and data.Quests.Actives and data.Quests.Actives[event.quest])and types.QuestsUtils and type(types.QuestsUtils.CanTake)=="function"then
             local ok,allowed=pcall(types.QuestsUtils.CanTake,player,event.quest)
             assert(ok,"Não foi possível validar os requisitos do treinamento")
-            if allowed==false then error("Treinamento bloqueado pelos requisitos do jogo: "..event.quest)end
+            if allowed==false then
+                notify("Treinamento bloqueado pelos requisitos do jogo: "..event.style)
+                return false
+            end
         end
+        for index=1,7 do
+            local other=Fluent.Options["EventStyle"..index]
+            if other and other.Value and other.Title~=event.style then pcall(function()other:SetValue(false)end)end
+        end
+        if farmControl and farmControl.Value then pcall(function()farmControl:SetValue(false)end)end
+        if Fluent.Options.EventSwordFarm and Fluent.Options.EventSwordFarm.Value then pcall(function()Fluent.Options.EventSwordFarm:SetValue(false)end)end
+        if Fluent.Options.SeaBeastFarm and Fluent.Options.SeaBeastFarm.Value then pcall(function()Fluent.Options.SeaBeastFarm:SetValue(false)end)end
+        if Fluent.Options.SeaBeastOnly and Fluent.Options.SeaBeastOnly.Value then pcall(function()Fluent.Options.SeaBeastOnly:SetValue(false)end)end
         storyToggle:SetValue(true)
         if request~=eventRequestSerial then stopStory();pcall(function()storyToggle:SetValue(false)end);return false end
         assert(enabled,"Não foi possível iniciar o treinamento")
         eventQuest=event;info.eventQuest=event.quest;auxiliaries[event.quest]=true
         return true
     end
-    return {startEvent=startStyleEvent,tick=tick,step=step,followFish=function()minigameBridge.follow()end,stop=stopStory,active=function()return enabled end,blocked=function()return halted()or locked("Converse")end,pick=function()return focus and valid(focus)and focus or nil end,debug=function()return info end,disable=function()stopStory();pcall(function()storyToggle:SetValue(false)end)end}
+    return {setStory=setStory,startEvent=startStyleEvent,tick=tick,step=step,followFish=function()minigameBridge.follow()end,stop=stopStory,active=function()return enabled end,blocked=function()return halted()or locked("Converse")end,pick=function()return focus and valid(focus)and focus or nil end,debug=function()return info end,disable=function()stopStory();pcall(function()storyToggle:SetValue(false)end)end}
 end)()
 loop("HISTORIA",0.12,storyController.tick)
 table.insert(connections,RS.Heartbeat:Connect(function(dt)guard("Voo da historia",function()storyController.step(dt)end)end))
@@ -6645,11 +7248,17 @@ do
         {style="Dark Step",quest="The Path of Flames",npc="Flame Master"},
         {style="Eletric",quest="The Thunder Fist",npc="Rustfall Storm Keeper"},
         {style="Water Kung-Fu",quest="The Dance of the Tides",npc="Tide Master"},
+        {style="Geppo",quest="The Sky Hermit",npc="Sky Hermit",ability="Geppo",price=2500},
+        {style="Soru",quest="The Phantom Tablet",npc="Mysterious Monk",ability="Soru"},
+        {style="Haki da Observacao",quest="Vox Sense Training",npc="Askard",ability="Kenbushoku"},
+        {style="Haki do Armamento",quest="Vox Armor Training",npc="Askard",ability="Busoshoku",requiresAbility="Kenbushoku"},
     }
     local startingStyles={}
     local training=tabs.events:AddSection("Estilos de luta")
+    local powers=tabs.events:AddSection("Geppo, Soru e Haki")
     for index,event in ipairs(styles)do
-        local control=training:AddToggle("EventStyle"..index,{Title=event.style,Default=false,Callback=function(value)
+        local section=event.ability and powers or training
+        local control=section:AddToggle("EventStyle"..index,{Title=event.style,Default=false,Callback=function(value)
             if value then
                 startingStyles[index]=true
                 local started
@@ -6678,6 +7287,163 @@ do
 
     end)
 end
+
+eventSwordController=(function()
+    local selected="Azure Glaive"
+    local enabled=false
+    local nextTeleport=0
+    local usingBoss=false
+    local transition,combatLocation
+    local nextEnemyRefresh=0
+    local loadingCache,loadingAt=false,0
+    local function loading()
+        if os.clock()<loadingAt then return loadingCache end
+        loadingAt=os.clock()+.1;loadingCache=false
+        local gui=player:FindFirstChildOfClass("PlayerGui")
+        for _,object in ipairs(gui and gui:GetDescendants()or {})do
+            local name=object.Name:lower()
+            if(name=="loading"or name=="loadingscreen"or name=="loadingframe"or name=="teleportscreen")and isVisible(object)then
+                if object:IsA("ScreenGui")or(object:IsA("GuiObject")and object.AbsoluteSize.X>=300 and object.AbsoluteSize.Y>=180)then loadingCache=true;break end
+            end
+        end
+        return loadingCache
+    end
+    local function sameArena(root,part)
+        return root and part and(root.Position-part.Position).Magnitude<=800 and math.abs(root.Position.Y-part.Position.Y)<=150
+    end
+    local function blocked()
+        return enabled and(transition~=nil or loading()or(usingBoss and combatLocation~=player:GetAttribute("CurrentLocation")))
+    end
+    local option,panel
+    local notifiedUnspawned=false
+    local info={phase="DESLIGADO",active=false}
+    local choices={"Azure Glaive","Blazebound","Golden Rapier","Shadow Blade","Tenrai"}
+    local function owns(data,name)
+        for _,container in ipairs({player.Character,player:FindFirstChildOfClass("Backpack")})do
+            if container then for _,tool in ipairs(container:GetChildren())do if tool:IsA("Tool")and tool.Name==name then return true end end end
+        end
+        for _,key in ipairs({"Unequiped","Bank"})do
+            for _,item in pairs(data.Tools and data.Tools[key]or {})do if type(item)=="table"and item.Name==name then return true end end
+        end
+        return false
+    end
+    local function pauseBoss()
+        if usingBoss and bossControl.Value and state.bossName==selected then bossControl:SetValue(false)end
+        usingBoss=false;combatLocation=nil
+    end
+    local function stop()
+        enabled=false;info.active=false;transition=nil;notifiedUnspawned=false;pauseBoss();info.phase="DESLIGADO"
+    end
+    local function phase(text)info.phase=text;if panel then pcall(function()panel:SetDesc(text)end)end end
+    local function tick()
+        if not enabled or not state.alive then return end
+        local api=clientAPI();local data=api.DataStore.IsClient:Get()
+        if not data then phase("AGUARDANDO DADOS DO INVENTARIO");return end
+        if owns(data,selected)then
+            option:SetValue(false);phase("ESPADA OBTIDA: "..selected);notify("Espada obtida: "..selected);return
+        end
+        if(storyController and storyController.active())or(seaBeastController and seaBeastController.active())
+            or(state.farm and not state.bossMode)or(usingBoss and state.bossName~=selected)then
+            option:SetValue(false);return
+        end
+        local types=require(game:GetService("ReplicatedStorage").Shared.MainModules)
+        local spec=types.ConditionalSpawnsSettings and types.ConditionalSpawnsSettings.Teleport
+        local minimum=spec and tonumber(spec.MinLevel)or 50
+        local level=data.Statistics and tonumber(data.Statistics.Level)or 0
+        if level<minimum then option:SetValue(false);phase("NIVEL MINIMO DO BOSS BOARD: "..minimum);notify(info.phase);return end
+        if os.clock()>=nextEnemyRefresh then nextEnemyRefresh=os.clock()+2;refreshLists()end
+        local _,hum,root=character()
+        if not root or not hum or hum.Health<=0 then pauseBoss();phase("AGUARDANDO RESPAWN PARA O BOSS");return end
+        local location=player:GetAttribute("CurrentLocation")
+        if loading()then
+            if not transition then transition={origin=root.Position,location=location,at=os.clock()}end
+            transition.landedAt=nil;pauseBoss();phase("CARREGAMENTO NATIVO: MOVIMENTO DO FARM PAUSADO");return
+        end
+        if usingBoss and combatLocation~=location and not transition then
+            transition={origin=root.Position,location=combatLocation,at=os.clock(),landedAt=os.clock(),lastPosition=root.Position}
+            pauseBoss()
+        end
+        if transition then
+            pauseBoss()
+            local changed=location~=transition.location or(root.Position-transition.origin).Magnitude>120
+            if changed and not transition.landedAt then transition.landedAt=os.clock();transition.lastPosition=root.Position end
+            if transition.landedAt then
+                if transition.lastPosition and(root.Position-transition.lastPosition).Magnitude>30 then transition.landedAt=os.clock()end
+                transition.lastPosition=root.Position
+                if os.clock()-transition.landedAt<2.5 then phase("AGUARDANDO ESTABILIZAR A CHEGADA NA ARENA");return end
+                transition=nil
+            elseif os.clock()-transition.at<12 then phase("AGUARDANDO TELEPORTE NATIVO DO BOSS");return
+            else transition=nil end
+        end
+        local found,unstreamed
+        for _,model in ipairs(cachedEnemies)do
+            local health=enemyHealth(model)
+            if original(model)==selected and health and health>0 and model:GetAttribute("Dead")~=true then
+                local part=model:FindFirstChild("HumanoidRootPart")
+                if part and model:GetAttribute("Ready")~=false and model:GetAttribute("Render")~=false then found=model;break
+                elseif part then unstreamed=part.Position end
+            end
+        end
+        if found and sameArena(root,found:FindFirstChild("HumanoidRootPart"))then
+            notifiedUnspawned=false
+            if not usingBoss then
+                state.bossName=selected
+                bossControl:SetValue(true);state.bossName=selected;usingBoss=true;combatLocation=location
+            end
+            phase("FARMANDO "..selected.."; ATE CONFIRMAR A ESPADA NO INVENTARIO");return
+        end
+        pauseBoss()
+        local ignore=workspace:FindFirstChild("IgnoreList");local world=ignore and ignore:FindFirstChild("Data")
+        local beacons=world and world:FindFirstChild("BossBeacons")
+        local respawns=world and world:FindFirstChild("BossRespawns")
+        local beacon=beacons and beacons:FindFirstChild(selected)
+        if not beacon then
+            local waiting=respawns and respawns:FindFirstChild(selected)
+            local at=waiting and waiting:GetAttribute("RespawnAt")
+            info.respawnAt=at
+            phase("AGUARDANDO SPAWN NO BOSS BOARD: "..selected)
+            if not notifiedUnspawned then
+                notifiedUnspawned=true
+                local remaining=type(at)=="number"and math.max(0,math.ceil(at-workspace:GetServerTimeNow()))or nil
+                local timeText=remaining and remaining>0 and(" (Respawn em ~"..math.floor(remaining/60).."m "..(remaining%60).."s)")or ""
+                notify("Boss não está spawnado: "..selected..timeText..". Aguardando spawn...")
+            end
+            return
+        end
+        notifiedUnspawned=false
+        local beaconPoint=select(1, (function(b)
+            if b:IsA("BasePart")then return b.Position end
+            if b:IsA("Model")then return b:GetPivot().Position end
+            local p=b:GetAttribute("Position")or b:GetAttribute("CFrame")
+            if typeof(p)=="Vector3"then return p elseif typeof(p)=="CFrame"then return p.Position end
+        end)(beacon)) or unstreamed
+        if beaconPoint and (root.Position-beaconPoint).Magnitude<=850 then
+            task.spawn(function()pcall(function()player:RequestStreamAroundAsync(beaconPoint,3)end)end)
+        end
+        if os.clock()<nextTeleport then phase("AGUARDANDO TELEPORTE / RENDER DO BOSS: "..selected);return end
+        nextTeleport=os.clock()+math.max(30,spec and tonumber(spec.Cooldown)or 30)
+        cancelTravel();target=nil
+        transition={origin=root.Position,location=location,at=os.clock()}
+        api.Network:FireServer("BossTeleport",selected)
+        phase("TELEPORTE NATIVO SOLICITADO: "..selected)
+    end
+    local section=tabs.events:AddSection("Espadas do Boss Board")
+    section:AddDropdown("EventSwordChoice",{Title="Selecionar espada",Values=choices,Default=selected,Callback=function(value)
+        if not table.find(choices,value)then return end
+        pauseBoss();transition=nil;notifiedUnspawned=false;selected=value;info.sword=value;nextTeleport=0;nextEnemyRefresh=0
+    end})
+    option=section:AddToggle("EventSwordFarm",{Title="Farm espada",Default=false,Callback=function(value)
+        stop()
+        if not value then return end
+        for _,id in ipairs({"FarmAutomatico","MaterialFarm","BossFarm","StoryFarm","CollectibleFarm","FruitCollect","FreeFly","SeaBeastFarm","SeaBeastOnly"})do
+            local other=Fluent.Options[id];if other and other.Value then other:SetValue(false)end
+        end
+        cancelTravel();enabled=true;info.active=true;nextTeleport=0;nextEnemyRefresh=0;phase("PROCURANDO "..selected)
+    end})
+    panel=internalStatus({Title="Estado da espada",Content="DESLIGADO"})
+    loop("Eventos: espadas",.5,function()guard("Evento de espada",tick)end)
+    return {stop=stop,blocked=blocked,debug=function()info.transition=transition~=nil;return info end}
+end)()
 
 stormController=(function()
     local warnings={}
@@ -6770,68 +7536,6 @@ stormController=(function()
 end)()
 
 do
-    local enabled=true
-    local attempts=setmetatable({},{__mode="k"})
-    local popupNames={gift=true,giftframe=true,giftpopup=true,giftscreen=true,present=true,
-        presentframe=true,rewardpopup=true,rewardreveal=true,unlockpopup=true,itemobtained=true}
-    local actions={open=true,claim=true,collect=true,continue=true,confirm=true,
-        abrir=true,resgatar=true,coletar=true,continuar=true,confirmar=true,gift=true,present=true}
-    local function normalize(text)
-        return tostring(text or ""):gsub("<[^>]*>",""):lower():gsub("[%s_%-]","")
-    end
-    local function visible(object,gui)
-        local current=object
-        while current and current~=gui do
-            if current:IsA("GuiObject")and not current.Visible then return false end
-            if current:IsA("ScreenGui")and not current.Enabled then return false end
-            current=current.Parent
-        end
-        return current==gui
-    end
-    tabs.others:AddToggle("AutoClaimGifts",{Title="Resgatar presentes automaticamente",Default=true,Callback=function(value)
-        enabled=value
-    end})
-    loop("Presentes",.5,function()
-        if not enabled or type(getconnections)~="function"then return end
-        local gui=player:FindFirstChildOfClass("PlayerGui")
-        if not gui then return end
-        for button in pairs(attempts)do if not button.Parent or not visible(button,gui)then attempts[button]=nil end end
-        for _,popup in ipairs(gui:GetDescendants())do
-            if popup:IsA("GuiObject")and popupNames[normalize(popup.Name)]and visible(popup,gui)
-                and popup.AbsoluteSize.X>=100 and popup.AbsoluteSize.Y>=100 then
-                local candidates={}
-                if popup:IsA("GuiButton")then candidates[#candidates+1]=popup end
-                for _,child in ipairs(popup:GetDescendants())do
-                    if child:IsA("GuiButton")and child.Active and visible(child,gui)then
-                        local label=child:IsA("TextButton")and child.Text or ""
-                        if label==""then local text=child:FindFirstChildWhichIsA("TextLabel",true);label=text and text.Text or ""end
-                        if actions[normalize(child.Name)]or actions[normalize(label)]
-                            or(child:IsA("ImageButton")and child.AbsoluteSize.X>=100 and child.AbsoluteSize.Y>=100)then
-                            candidates[#candidates+1]=child
-                        end
-                    end
-                end
-                for _,button in ipairs(candidates)do
-                    local attempt=attempts[button]or {count=0,at=0}
-                    if attempt.count<3 and os.clock()-attempt.at>=1 then
-                        for _,signal in ipairs({button.Activated,button.MouseButton1Click})do
-                            for _,connection in ipairs(getconnections(signal))do
-                                if connection.Enabled~=false and type(connection.Function)=="function"then
-                                    attempt.at=os.clock();attempt.count=attempt.count+1;attempts[button]=attempt
-                                    local ok,message=pcall(connection.Function)
-                                    env.SOWxGiftStatus={popup=popup:GetFullName(),button=button.Name,requested=ok,error=not ok and tostring(message)or nil}
-                                    return
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end)
-end
-
-do
     local enabled=false
     env.SOWxArmamentCharacters=env.SOWxArmamentCharacters or setmetatable({},{__mode="k"})
     local characters=env.SOWxArmamentCharacters
@@ -6871,7 +7575,7 @@ do
         local ok,message=pcall(function()modules.Network:FireServer("Busoshoku","Toggle")end)
         env.SOWxArmamentStatus=ok and"Ativacao solicitada; sem repeticao nesta vida"or tostring(message)
     end
-    tabs.others:AddToggle("AutoArmament",{Title="Auto ativar Haki do Armamento",Default=false,Callback=function(value)
+    farmSections.run:AddToggle("AutoArmament",{Title="Auto ativar Haki do Armamento",Default=false,Callback=function(value)
         enabled=value
         env.SOWxArmamentStatus=value and"Aguardando ativacao"or"Desligado"
     end})
@@ -6885,12 +7589,12 @@ bossGuardian=(function()
     local nextDecision,safePoint=0,nil
     local info={phase="DESLIGADO",warnings=0,dodges=0,returns=0}
     local log=internalStatus({Title="Esquiva de bosses",Content="DESLIGADO"})
-    local section=farmSections.protection
+    local section=farmSections.attack
     local function phase(text)
         info.phase=text;pcall(function()log:SetDesc(text)end)
     end
     local function context()
-        if not(enabled and state.alive and state.farm and(state.story or state.bossMode))then return false end
+        if not(enabled and state.alive and state.farm)then return false end
         if playerLocks then
             local ok,blocked=pcall(function()return playerLocks:IsActive("Cutscene")or playerLocks:IsActive("Converse")or playerLocks:IsActive("Server")end)
             if ok and blocked then return false end
@@ -6938,7 +7642,8 @@ bossGuardian=(function()
             if type(wire)=="table"and typeof(wire.Center)=="Vector3"and typeof(wire.Direction)=="Vector3"and type(wire.Hit)=="number"and type(wire.Active)=="number"then
                 if wire.Kind=="Circle"or wire.Kind=="Ring"or wire.Kind=="Box"or wire.Kind=="Line"then
                     local copy={Kind=wire.Kind,Center=wire.Center,Direction=wire.Direction,Radius=wire.Radius,InnerRadius=wire.InnerRadius,Width=wire.Width,Length=wire.Length}
-                    list[#list+1]={wire=copy,hit=at+wire.Hit,finish=at+wire.Hit+wire.Active+0.2}
+                    local activeDur=math.max(tonumber(wire.Active)or 0,0.45)
+                    list[#list+1]={wire=copy,hit=at+wire.Hit,finish=at+wire.Hit+activeDur+0.25}
                 end
             end
         end
@@ -6962,7 +7667,26 @@ bossGuardian=(function()
         showWrapper=function(data)pcall(observe,data);return oldShow(data)end
         clearWrapper=function(data)
             if type(data)=="table"and cues[data.Owner]then
-                if data.Id==nil then cues[data.Owner]=nil else cues[data.Owner][data.Id]=nil end
+                local t=now()
+                local function keepActive(entries)
+                    if type(entries)~="table"then return nil end
+                    local kept={}
+                    for _,entry in ipairs(entries)do
+                        if entry.finish>t and t>=entry.hit-0.35 then
+                            kept[#kept+1]=entry
+                        end
+                    end
+                    return #kept>0 and kept or nil
+                end
+                if data.Id==nil then
+                    local nextGroups={}
+                    for id,entries in pairs(cues[data.Owner])do
+                        nextGroups[id]=keepActive(entries)
+                    end
+                    cues[data.Owner]=next(nextGroups)and nextGroups or nil
+                else
+                    cues[data.Owner][data.Id]=keepActive(cues[data.Owner][data.Id])
+                end
             end
             return oldClear(data)
         end
@@ -6977,7 +7701,7 @@ bossGuardian=(function()
                 for _,entry in ipairs(entries)do
                     if entry.finish>time then
                         alive=true
-                        if entry.hit-time<=0.9 then result[#result+1]=entry.wire end
+                        if entry.hit-time<=1.5 then result[#result+1]=entry.wire end
                     end
                 end
                 if not alive then groups[id]=nil end
@@ -6986,21 +7710,38 @@ bossGuardian=(function()
         return result
     end
     local function dangerous(point,list)
-        for _,wire in ipairs(list)do if contains(wire,point,4)then return true end end
+        for _,wire in ipairs(list)do if contains(wire,point,5)then return true end end
         return false
     end
-    local function ground(point)
-        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include
-        local geometry={workspace.Terrain};local map=workspace:FindFirstChild("Map");if map then geometry[#geometry+1]=map end
-        params.FilterDescendantsInstances=geometry;params.IgnoreWater=false
-        local hit=workspace:Raycast(point+Vector3.new(0,12,0),Vector3.new(0,-48,0),params)
-        if not hit or hit.Material==Enum.Material.Water or hit.Normal.Y<0.6 then return nil end
+    local function ground(point,bossRoot)
+        local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Exclude
+        local excluded={player.Character}
+        local ef=enemiesFolder();if ef then excluded[#excluded+1]=ef end
+        local ignore=workspace:FindFirstChild("IgnoreList")
+        if ignore then
+            local temp=ignore:FindFirstChild("Temp");if temp then excluded[#excluded+1]=temp end
+            local data=ignore:FindFirstChild("Data");if data then excluded[#excluded+1]=data end
+        end
+        params.FilterDescendantsInstances=excluded;params.IgnoreWater=false
+        if bossRoot then
+            local origin=bossRoot.Position+Vector3.new(0,3,0)
+            local targetPos=Vector3.new(point.X,origin.Y,point.Z)
+            local delta=targetPos-origin
+            if delta.Magnitude>4 then
+                local wallHit=workspace:Raycast(origin,delta,params)
+                if wallHit and wallHit.Instance and wallHit.Instance.CanCollide and (wallHit.Position-origin).Magnitude<delta.Magnitude-2 then
+                    return nil
+                end
+            end
+        end
+        local hit=workspace:Raycast(point+Vector3.new(0,18,0),Vector3.new(0,-64,0),params)
+        if not hit or hit.Material==Enum.Material.Water or hit.Normal.Y<0.5 then return nil end
         if hit.Instance:IsA("BasePart")and not hit.Instance.CanCollide then return nil end
         return hit.Position+Vector3.new(0,4,0)
     end
     local function choose(root,bossRoot,list,retreat,returnHome)
         local choices={}
-        for _,radius in ipairs(returnHome and {5,6,8,10}or retreat and {55,70,85,110,145}or {16,28,45,65,85,110,145})do
+        for _,radius in ipairs(returnHome and {5,6,8,10}or retreat and {32,45,60,78,95}or {16,24,34,46,60,78,95})do
             for i=0,15 do
                 local angle=i*math.pi/8
                 local point=bossRoot.Position+Vector3.new(math.cos(angle)*radius,root.Position.Y-bossRoot.Position.Y,math.sin(angle)*radius)
@@ -7010,9 +7751,14 @@ bossGuardian=(function()
             end
         end
         table.sort(choices,function(a,b)return a.score<b.score end)
-        for i=1,math.min(12,#choices)do
-            local point=ground(choices[i].point)
-            if point and not dangerous(point,list)and(point-bossRoot.Position).Magnitude<=160 then return point end
+        for i=1,math.min(18,#choices)do
+            local point=ground(choices[i].point,bossRoot)
+            if point and not dangerous(point,list)and(point-bossRoot.Position).Magnitude<=130 then return point end
+        end
+        for i=1,math.min(6,#choices)do
+            local raw=choices[i].point
+            local fallback=Vector3.new(raw.X,math.max(root.Position.Y,bossRoot.Position.Y+14),raw.Z)
+            if not dangerous(fallback,list)then return fallback end
         end
     end
     local function move(root,point,bossRoot)
@@ -7054,7 +7800,7 @@ bossGuardian=(function()
         if os.clock()<nextDecision then return end
         nextDecision=os.clock()+0.1
         info.health=hp;info.maxHealth=maximum
-        if control and not recovering then
+        if control and not recovering and #list==0 then
             local attackPoint=choose(root,bossRoot,list,false,true)
             if attackPoint then
                 move(root,attackPoint,bossRoot)
@@ -7067,18 +7813,22 @@ bossGuardian=(function()
             control=true;noclip.set("bossGuard",true)
             if skillAim then skillAim.stop()end
             -- Hold a safe retreat instead of selecting another retreat every heartbeat.
-            if recovering and safePoint and not dangerous(root.Position,list)and (root.Position-bossRoot.Position).Magnitude>=50 then
+            if recovering and safePoint and not dangerous(root.Position,list)and (root.Position-bossRoot.Position).Magnitude>=28 then
+                move(root,safePoint,bossRoot)
                 phase("RECUANDO: AGUARDANDO RECUPERAR 70% DE VIDA");return
             end
             local point=choose(root,bossRoot,list,recovering)
             if point then
-                if not safePoint or (point-safePoint).Magnitude>3 then move(root,point,bossRoot);info.dodges=info.dodges+1 end
-                safePoint=point;phase(recovering and "RECUANDO: AGUARDANDO RECUPERAR 70% DE VIDA"or "DESVIANDO DA AREA DO ATAQUE")
+                if not safePoint or (point-safePoint).Magnitude>3 then info.dodges=info.dodges+1 end
+                safePoint=point;move(root,point,bossRoot)
+                phase(recovering and "RECUANDO: AGUARDANDO RECUPERAR 70% DE VIDA"or "DESVIANDO DA AREA DO ATAQUE")
             else phase("SEM PONTO SECO LIVRE CONFIRMADO")end
-        elseif control and safePoint and #list>0 then phase("AGUARDANDO O ATAQUE TERMINAR")
+        elseif control and safePoint and #list>0 then
+            move(root,safePoint,bossRoot)
+            phase("AGUARDANDO O ATAQUE TERMINAR")
         else control=false;safePoint=nil;noclip.set("bossGuard",false);phase("MONITORANDO ATAQUES")end
     end
-    section:AddToggle("BossGuard",{Title="Auto esquiva e recuperação",Default=false,Callback=function(value)
+    section:AddToggle("BossGuard",{Title="Proteção contra bosses e skills de NPC",Default=false,Callback=function(value)
         enabled=value
         if value then
             local ok=guard("Avisos do boss",install)
@@ -7096,7 +7846,7 @@ loop("Objetivos", 1, function()
         local names = refreshBosses()
         local signature = table.concat(names,"\0")
         if signature ~= bossListSignature then bossListSignature = signature;guard("Lista de bosses",function()bossDropdown:SetValues(names)end) end
-        nextCache = os.clock() + 5
+        nextCache = os.clock() + (state.materialFarm and 1.5 or 5)
     end
     currentLevel = readLevel()
     refreshQuestCatalog(false)
@@ -7152,14 +7902,15 @@ attackController = (function()
         return data, args
     end
     local function active()
-        return state.alive and not Fluent.Unloaded and state.attack and not travel and not (bossGuardian and bossGuardian.busy())and not UIS:GetFocusedTextBox()
+        return state.alive and not Fluent.Unloaded and state.attack and not travel and not UIS:GetFocusedTextBox()
             and os.clock() >= state.attackSuppressedUntil
     end
     local function inRange(model)
         local _, hum, root = character()
         local enemyRoot = model and model:FindFirstChild("HumanoidRootPart")
+        local maxRange = math.max(22, (state.distance or 5) + math.abs(state.height or 0) + 10)
         return valid(model) and hum and hum.Health > 0 and root and enemyRoot
-            and (root.Position - enemyRoot.Position).Magnitude <= 18
+            and (root.Position - enemyRoot.Position).Magnitude <= maxRange
     end
     local function hitResults(hit)
         if not state.fastAttack or typeof(hit.boxSize)~="Vector3"or typeof(hit.boxOffset)~="CFrame"then return {hit.target}end
@@ -7252,7 +8003,7 @@ attackController = (function()
         combo, previousTool, lastComboAt = nextCombo, tool, now
         local effects={Class="Default",Action="Activated",ComboType="Default",Combo=combo,CallTime=callTime,DelayTime=tonumber(args.EffectsDelay)or 0}
         remoteEvent("CombatTools"):FireServer("ActivatedEffects",effects,args.ActivatedName)
-        if nativeFX and type(nativeFX.Activated)=="function"and now>=nextFX and runningFX<2 and not (bossGuardian and bossGuardian.protectsMovement and bossGuardian.protectsMovement())then
+        if nativeFX and type(nativeFX.Activated)=="function"and now>=nextFX and runningFX<2 then
             nextFX=now+0.125;runningFX=runningFX+1
             local fxCharacter,fxToolName,fxVariant=player.Character,tool.Name,args.ActivatedName
             task.spawn(function()
@@ -7432,10 +8183,12 @@ loop("RECUPERACAO DO COMBATE",0.1,function()
 end)
 local nextSkill,skillEpoch = 0,0
 loop("Skills", 0.2, function()
+    if eventSwordController and eventSwordController.blocked()then return end
     if travel or not state.skills or UIS:GetFocusedTextBox() or (bossGuardian and bossGuardian.busy())or (storyController and storyController.active()and storyController.blocked())then return end
     if not valid(target) or (state.quests and not questReady) then return end
     local _, hum, root = character()
-    if not target or not root or not hum or hum.Health <= 0 or (root.Position - target.HumanoidRootPart.Position).Magnitude > 18 then return end
+    local maxSkillRange = math.max(22, (state.distance or 5) + math.abs(state.height or 0) + 10)
+    if not target or not root or not hum or hum.Health <= 0 or (root.Position - target.HumanoidRootPart.Position).Magnitude > maxSkillRange then return end
     local skillTool=equip()
     if not skillTool then return end
     if skillEpoch~=(state.equipEpoch or 0) then skillEpoch=state.equipEpoch or 0;nextSkill=0 end
@@ -7591,7 +8344,7 @@ local function runtimeStatus()
                 level = model:GetAttribute("Level"), valid = not not valid(model), distance = root and enemyRoot and (root.Position - enemyRoot.Position).Magnitude})
         end
     end
-    return {build = "1.3.242", catalog = questCatalogStatus, attack = attackController and attackController.debug(), serverSearch = serverHop.debug(), alive = state.alive, farm = state.farm, quest = desiredQuest and desiredQuest.id, questPhase = questPhase,
+    return {build = "1.3.265-materiais", catalog = questCatalogStatus, attack = attackController and attackController.debug(), serverSearch = serverHop.debug(), alive = state.alive, farm = state.farm, quest = desiredQuest and desiredQuest.id, questPhase = questPhase,
         questReady = questReady, activeQuests = actives, level = currentLevel, lastError = lastFailure, target = target and original(target),
         teleportUnavailable=env.SOWxUnavailableDestinations,gift=env.SOWxGiftStatus,
         fruits=env.SOWxFruitController and env.SOWxFruitController.debug()or nil,
@@ -7602,7 +8355,7 @@ local function runtimeStatus()
         equipped=(function()local list={};local c=player.Character;if c then for _,v in ipairs(c:GetChildren())do if v:IsA("Tool")then list[#list+1]=v.Name end end end;return list end)(),
         position = root and {x = root.Position.X, y = root.Position.Y, z = root.Position.Z},
         travel = travel and {phase = travel.phase, label = travel.label, owner = travel.owner},
-        candidates = candidates, seaBeast=seaBeastController and seaBeastController.debug(), autoStats=autoStats and autoStats.debug(), story=storyController and storyController.debug(), bossGuard=bossGuardian and bossGuardian.debug(), collectibles = collectibleFarm.debug()}
+        candidates = candidates, eventSword=eventSwordController and eventSwordController.debug(), dash=dashExtras.debug(),seaBeast=seaBeastController and seaBeastController.debug(), autoStats=autoStats and autoStats.debug(), story=storyController and storyController.debug(), bossGuard=bossGuardian and bossGuardian.debug(), collectibles = collectibleFarm.debug()}
 end
 loop("Registro local", 2, function()
     if type(writefile) ~= "function" then return end
@@ -8022,7 +8775,7 @@ task.spawn(function()
             end
             if not target then
                 restore();status(#scan>0 and "Aguardando nova tentativa de coleta"or "Nenhuma fruta replicada neste servidor")
-                if flags.hop and not hasTargets()and os.clock()-started>=25 then hop()end
+                -- Auto hop de frutas removido; coleta permanece no servidor atual.
                 return
             end
             moving=true;status("Indo buscar "..target.Name)
@@ -8041,6 +8794,7 @@ task.spawn(function()
     end
 end)
 function C.set(key,value)
+    if key=="hop"then flags.hop=false;return end
     assert(flags[key]~=nil,"Opção de frutas desconhecida")
     if value and (key=="collect"or key=="hop"or key=="store")and C.host and C.host.pause then C.host.pause()end
     flags[key]=value==true
@@ -8081,7 +8835,7 @@ return C
     end
     local control=assert(loadstring(source))()
     control.host={pause=function()
-        for _,id in ipairs({"StoryFarm","FishingFarm","FarmAutomatico","BossFarm","CollectibleFarm","FreeFly","SeaBeastFarm","SeaBeastOnly"})do
+        for _,id in ipairs({"StoryFarm","FishingFarm","FarmAutomatico","MaterialFarm","BossFarm","CollectibleFarm","FreeFly","SeaBeastFarm","SeaBeastOnly"})do
             local option=Fluent.Options[id]
             if option and option.Value then option:SetValue(false)end
         end
@@ -8093,8 +8847,6 @@ return C
     collect:AddToggle("FruitStore",{Title="Armazenar frutas",Default=states.store,Callback=function(v)control.set("store",v)end})
     local visual=tabs.fruits:AddSection("Visual")
     visual:AddToggle("FruitESP",{Title="ESP frutas",Default=states.esp,Callback=function(v)control.set("esp",v)end})
-    local servers=tabs.fruits:AddSection("Servidores")
-    servers:AddToggle("FruitHop",{Title="Auto hop de frutas",Default=states.hop,Callback=function(v)control.set("hop",v)end})
     local panel=internalStatus({Title="Frutas",Content="Parado"})
     loop("Estado de frutas",1,function()
         if not control.alive then return end
@@ -8104,7 +8856,7 @@ return C
         end
         local data=control.debug()
         panel:SetDesc(data.phase.." | no mapa: "..tostring(data.visible).." | coletadas: "..tostring(data.collected).." | armazenadas: "..tostring(data.stored))
-        for id,key in pairs({FruitCollect="collect",FruitStore="store",FruitHop="hop",FruitESP="esp"})do
+        for id,key in pairs({FruitCollect="collect",FruitStore="store",FruitESP="esp"})do
             local option=Fluent.Options[id];local active=control.settings()[key]
             if option and option.Value~=active then option:SetValue(active)end
         end
@@ -8118,14 +8870,134 @@ seaBeastController=(function()
     local info={phase="DESLIGADO",kills=0}
     local boat,lastRoot,enemy,lastEnemy,requestedAt,nextAction,spawnBusy
     local inventoryCheckAt=0
+    local goalMarker,arrived=false,false
+    local launchPoint,launchTool,launchScanAt=nil,nil,0
+    local oceanBase
     local nav,shared,settings,goal,previousBosses
-    local flight=true
+    local collisionBoat,collisionParts=nil,{}
+    local waypoint,waypointUntil=nil,0
+    local routePlanner,routeClear,routeRetryAt=nil,nil,0
+    local islands,islandScanAt={},0
+    local controlTurnSide,cruiseReverse=nil,false
+    local function restoreBoatCollision()
+        for part,value in pairs(collisionParts)do pcall(function()part.CanCollide=value end)end
+        collisionParts={};collisionBoat=nil;info.boatNoclip=false
+    end
+    local function boatNoclip(model)
+        if collisionBoat~=model then restoreBoatCollision();collisionBoat=model end
+        if not model then return end
+        for _,part in ipairs(model:GetDescendants())do
+            if part:IsA("BasePart")then
+                if collisionParts[part]==nil then collisionParts[part]=part.CanCollide end
+                part.CanCollide=false
+            end
+        end
+    end
     local expectedBoat,corrections= nil,0
     local progressDistance,progressAt,enemyScanAt= nil,0,0
     local section=tabs.farm:AddSection("Sea Beast")
-    local toggle,onlyToggle
+    local toggle,onlyToggle,statusPanel
     local function flat(v)return Vector3.new(v.X,0,v.Z)end
-    local function phase(text)info.phase=text end
+local function newSeaBoatRoute(clear)
+    local route,search
+    local spacing=300
+    local function key(x,z)return x..":"..z end
+    local function heapPush(heap,node)
+        heap[#heap+1]=node;local i=#heap
+        while i>1 do local p=math.floor(i/2);if heap[p].f<=node.f then break end;heap[i]=heap[p];i=p end
+        heap[i]=node
+    end
+    local function heapPop(heap)
+        local first=heap[1];local last=table.remove(heap)
+        if #heap>0 then
+            local i=1
+            while i*2<=#heap do
+                local c=i*2;if c<#heap and heap[c+1].f<heap[c].f then c=c+1 end
+                if heap[c].f>=last.f then break end
+                heap[i]=heap[c];i=c
+            end
+            heap[i]=last
+        end
+        return first
+    end
+    local function reset()route=nil;search=nil end
+    local function advance(position,destination)
+        if route then
+            while #route>0 and(route[1]-position).Magnitude<130 do table.remove(route,1)end
+            if #route==0 then route=nil;return destination,"DIRECT"end
+            -- Keep the chosen side until the complete remaining corridor is clear.
+            for i=math.min(#route,8),2,-1 do
+                if clear(position,route[i])then for _=1,i-1 do table.remove(route,1)end;break end
+            end
+            if clear(position,route[1])then return route[1],"DETOUR"end
+            reset()
+        end
+        if not search then
+            if clear(position,destination)then return destination,"DIRECT"end
+            local first={x=0,z=0,p=position,g=0,f=(destination-position).Magnitude}
+            search={origin=position,destination=destination,heap={first},best={[key(0,0)]=0},closed={},edges={},expanded=0}
+        end
+        local q=search
+        for _=1,24 do
+            local n=heapPop(q.heap)
+            if not n then reset();return nil,"NO_ROUTE"end
+            local nk=key(n.x,n.z)
+            if not q.closed[nk]then
+                q.closed[nk]=true;q.expanded=q.expanded+1
+                if q.expanded>6000 then reset();return nil,"NO_ROUTE"end
+                if(n.p-q.destination).Magnitude<=spacing*1.5 and clear(n.p,q.destination)then
+                    route={q.destination}
+                    while n.parent do table.insert(route,1,n.p);n=n.parent end
+                    search=nil;return route[1],"DETOUR"
+                end
+                for dx=-1,1 do for dz=-1,1 do
+                    if dx~=0 or dz~=0 then
+                        local x,z=n.x+dx,n.z+dz;local k=key(x,z)
+                        if not q.closed[k]then
+                            local p=q.origin+Vector3.new(x*spacing,0,z*spacing)
+                            local margin=5000
+                            if p.X>=math.min(q.origin.X,q.destination.X)-margin and p.X<=math.max(q.origin.X,q.destination.X)+margin
+                                and p.Z>=math.min(q.origin.Z,q.destination.Z)-margin and p.Z<=math.max(q.origin.Z,q.destination.Z)+margin then
+                                local g=n.g+spacing*math.sqrt(dx*dx+dz*dz)
+                                if not q.best[k]or g<q.best[k]then
+                                    local ek=nk..">"..k;local pass=q.edges[ek]
+                                    if pass==nil then pass=clear(n.p,p);q.edges[ek]=pass end
+                                    if pass then
+                                        q.best[k]=g
+                                        heapPush(q.heap,{x=x,z=z,p=p,g=g,f=g+(p-q.destination).Magnitude,parent=n})
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end end
+            end
+        end
+        return nil,"PLANNING"
+    end
+    return {advance=advance,reset=reset}
+end
+
+local function seaBoatControls(angle,speed,yawRate,distance,turnSide)
+    local absolute=math.abs(angle)
+    if absolute>2.6 then
+        turnSide=turnSide or(angle<0 and -1 or 1)
+        angle=absolute*turnSide
+    else turnSide=nil end
+    local wanted=100
+    if absolute>1 then wanted=14 elseif absolute>.45 then wanted=30 elseif absolute>.2 then wanted=55 end
+    wanted=math.min(wanted,math.sqrt(math.max(0,distance-45)*2*25))
+    local throttle
+    if speed>wanted+3 then throttle=-1
+    elseif speed<wanted-2 then throttle=math.clamp(wanted/100,.12,1)
+    else throttle=0 end
+    local steer=math.clamp(-angle*1.5+yawRate*1.15,-1,1)
+    return throttle,steer,turnSide,wanted
+end
+    local function phase(text)
+        info.phase=text
+        if statusPanel then pcall(function()statusPanel:SetDesc(text)end)end
+    end
     local function load()
         local r=game:GetService("ReplicatedStorage")
         nav=nav or require(r.Modules.Essentials.NavigationSystem).IsClient
@@ -8142,6 +9014,8 @@ seaBeastController=(function()
         end)
     end
     local function stop()
+        restoreBoatCollision();waypoint=nil;if routePlanner then routePlanner.reset()end
+        if travel and travel.owner=="seabeast"then cancelTravel()end
         enabled=false;enemy=nil;boat=nil;goal=nil;expectedBoat=nil
         inputOff();noclip.set("seabeast",false)
         state.attack=false;state.skills=false
@@ -8184,61 +9058,118 @@ seaBeastController=(function()
         local spawn=nav.SpawnBoatClient
         if not spawn.Placement or spawn.Placement.BoatName~=tool.Name then spawn.StartPlacement(tool.Name)end
         local spec=spawn.BoatInfos[tool.Name]
-        if not spec then return end
-        local ocean=shared.GetWaveHeight(root.Position.X,root.Position.Z,workspace:GetServerTimeNow(),nil)
+        if not spec then info.placement={reason="BOAT_GEOMETRY_PENDING",tool=tool.Name};return end
+        if launchTool~=tool.Name then launchPoint=nil;launchTool=tool.Name;launchScanAt=0 end
+        if launchPoint and os.clock()<launchScanAt then return launchPoint end
+        if os.clock()<launchScanAt then return end
+        launchScanAt=os.clock()+3
+        if oceanBase==nil then
+            local ok,config=pcall(function()
+                return require(game:GetService("ReplicatedStorage").Modules.Essentials.NavigationSystem["NavigationSystem Client"]["SwimSystem Client"].Config)
+            end)
+            if ok and config.Ocean then oceanBase=config.Ocean.DefaultBoneHeight end
+        end
+        local ocean=oceanBase or shared.GetWaveHeight(root.Position.X,root.Position.Z,workspace:GetServerTimeNow(),nil)
+        info.placement={ocean=ocean,groundRejected=0,blockedRejected=0,tool=tool.Name}
         local params=RaycastParams.new();params.FilterType=Enum.RaycastFilterType.Include
         local geometry={workspace.Terrain};local map=workspace:FindFirstChild("Map");if map then geometry[#geometry+1]=map end
-        params.FilterDescendantsInstances=geometry;params.IgnoreWater=false;params.RespectCanCollide=true
+        params.FilterDescendantsInstances=geometry;params.IgnoreWater=true;params.RespectCanCollide=true
         local overlap=OverlapParams.new();overlap.FilterType=Enum.RaycastFilterType.Exclude
         local excluded={player.Character};local ignore=workspace:FindFirstChild("IgnoreList");if ignore then excluded[#excluded+1]=ignore end
         overlap.FilterDescendantsInstances=excluded;overlap.RespectCanCollide=true
-        for _,radius in ipairs({60,100,150,200})do for angle=0,330,30 do
+        for _,radius in ipairs({60,100,150,200,300,450,650,900,1200,1600})do for angle=0,330,30 do
             local a=math.rad(angle);local p=root.Position+Vector3.new(math.cos(a)*radius,0,math.sin(a)*radius)
             local surface=workspace:Raycast(Vector3.new(p.X,ocean+50,p.Z),Vector3.new(0,-100,0),params)
             if not surface or surface.Material==Enum.Material.Water or surface.Position.Y<ocean-2 then
                 local cf=CFrame.new(p.X,ocean+spec.FloatHeight,p.Z)
                 local clear=true
                 for _,part in ipairs(workspace:GetPartBoundsInBox(cf*CFrame.new(spec.Offset),spec.Size,overlap))do
-                    if part.CanCollide then clear=false;break end
+                    if part.CanCollide then clear=false;info.placement.lastBlocker=part:GetFullName();break end
                 end
-                if clear then return cf end
-            end
+                if clear then launchPoint=cf;info.placement.reason="FOUND_WATER";info.placement.radius=radius;return cf end
+                info.placement.blockedRejected=info.placement.blockedRejected+1
+            else info.placement.groundRejected=info.placement.groundRejected+1 end
         end end
+        launchPoint=nil;info.placement.reason="NO_CLEAR_WATER"
     end
-    local function destination()
+    local function mapPingPoint(value)
+        if typeof(value)=="Vector3"then return value end
+        if type(value)~="string"then return end
+        local a,b=value:match("^%s*([^,]+),%s*([^,]+)%s*$")
+        local x,z=tonumber(a),tonumber(b)
+        if x and z and x==x and z==z and math.abs(x)<1000000 and math.abs(z)<1000000 then return Vector3.new(x,0,z)end
+    end
+    local function volcanoRearInfo()
         local map=workspace:FindFirstChild("Map");local areas=map and map:FindFirstChild("Areas")
         local island=areas and areas:FindFirstChild("Volcano Island")
         local center=island and island:GetAttribute("MapCenter")
-        if typeof(center)~="Vector3"then return end
+        if typeof(center)~="Vector3"then center=Vector3.new(-17554.377,0,10517.659)end
         local data=workspace:FindFirstChild("IgnoreList");data=data and data:FindFirstChild("Data")
         local spawns=data and data:FindFirstChild("Spawns");spawns=spawns and spawns:FindFirstChild("PlayerSpawns")
         local spawn=spawns and spawns:FindFirstChild("Volcano Island")
         local front=spawn and spawn:GetAttribute("CheckpointPosition")
-        if typeof(front)~="Vector3"then return end
+        if typeof(front)~="Vector3"then front=Vector3.new(-16514.014,203.339,9779.872)end
         local away=flat(center-front)
-        if away.Magnitude<1 then return end
-        local radius=(tonumber(island:GetAttribute("MapSize"))or 2712)/2
-        local p=center+away.Unit*(radius+settings.IslandDistance+350)
-        return Vector3.new(p.X,shared.GetWaveHeight(p.X,p.Z,workspace:GetServerTimeNow(),nil),p.Z)
+        if away.Magnitude<1 then away=Vector3.new(-0.816,0,0.578)end
+        local dir=away.Unit
+        local radius=(tonumber(island and island:GetAttribute("MapSize"))or 2712)/2
+        local rearWater=center+dir*(radius+140)
+        local farCruise=center+dir*(radius+3000)
+        local waveRear=shared.GetWaveHeight(rearWater.X,rearWater.Z,workspace:GetServerTimeNow(),nil)
+        local waveFar=shared.GetWaveHeight(farCruise.X,farCruise.Z,workspace:GetServerTimeNow(),nil)
+        return Vector3.new(rearWater.X,waveRear+20,rearWater.Z),Vector3.new(farCruise.X,waveFar,farCruise.Z),dir,center,radius
+    end
+    local function destination()
+        local ping=mapPingPoint(player:GetAttribute("MapPing"))
+        if ping then info.destinationSource="MARCA DO MAPA";return Vector3.new(ping.X,shared.GetWaveHeight(ping.X,ping.Z,workspace:GetServerTimeNow(),nil),ping.Z)end
+        info.destinationSource="ATRAS DO VULCAO (INDO PARA FRENTE)"
+        local _,farCruise=volcanoRearInfo()
+        return farCruise
+    end
+    local function seaPart(model)
+        return model and(model:FindFirstChild("HumanoidRootPart",true)or model.PrimaryPart)
+    end
+    local function seaAlive(model)
+        if not model or not model.Parent or model:GetAttribute("Dead")==true then return false end
+        local health=enemyHealth(model)
+        return health and health>0 and seaPart(model)~=nil
     end
     local function findEnemy(root)
         local best,gap=nil,math.huge
-        for _,model in ipairs(cachedEnemies)do
-            if model:IsA("Model")and (original(model)=="Sea Beast"or original(model)=="Ancestral Sea Beast")then
-                local part=model:FindFirstChild("HumanoidRootPart")
-                local health=enemyHealth(model)
-                if part and health and health>0 and model:GetAttribute("Dead")~=true then
-                    local distance=(part.Position-root.Position).Magnitude
-                    if distance<gap then best,gap=model,distance end
+        local seen={};local matches={}
+        local function consider(model)
+            if seen[model]or not model:IsA("Model")then return end
+            seen[model]=true
+            local name=(tostring(original(model)).." "..model.Name):lower():gsub("[_%-]"," ")
+            if name:find("sea beast",1,true)or name:find("seabeast",1,true)or name:find("abyssal beast",1,true)or name:find("fera abissal",1,true)then
+                local isAncestral=model:GetAttribute("Ancestral")==true or name:find("ancestral",1,true)~=nil
+                if #matches<8 then matches[#matches+1]={name=model.Name,alive=seaAlive(model),ancestral=isAncestral}end
+                if seaAlive(model)then
+                    local distance=(seaPart(model).Position-root.Position).Magnitude
+                    -- Prioriza Sea Beast normal se houver ambos, mas ataca qualquer Sea/Abyssal/Ancestral vivo.
+                    local score=distance+(isAncestral and 500 or 0)
+                    if score<gap then best,gap=model,score end
                 end
             end
         end
+        for _,model in ipairs(cachedEnemies)do consider(model)end
+        -- Discover the replicated beast even if the common humanoid index is stale.
+        if type(workspace.GetDescendants)=="function"then
+            for _,model in ipairs(workspace:GetDescendants())do
+                if model:IsA("Model")then
+                    local name=model.Name:lower()
+                    if name:find("sea")or name:find("abyssal")then consider(model)end
+                end
+            end
+        end
+        info.seaCandidates=matches
         return best
     end
     local function flyTo(root,point,dt)
         local delta=point-root.Position;local distance=delta.Magnitude
         if distance<1 then return true end
-        local p=root.Position+delta.Unit*math.min(distance,100*math.min(dt,.05))
+        local speed=math.max(state.travelSpeed or 270,220)
+        local p=root.Position+delta.Unit*math.min(distance,speed*math.min(dt,.05))
         local facing=flat(delta)
         root.CFrame=facing.Magnitude>.01 and CFrame.lookAt(p,p+facing.Unit)or CFrame.new(p)*root.CFrame.Rotation
         root.AssemblyLinearVelocity=Vector3.zero;root.AssemblyAngularVelocity=Vector3.zero
@@ -8256,44 +9187,91 @@ seaBeastController=(function()
         end
         load()
         local char,hum,root=character()
-        if not root or not hum or hum.Health<=0 then inputOff();enemy=nil;state.attack=false;state.skills=false;phase("AGUARDANDO RESPAWN");return end
+        if not root or not hum or hum.Health<=0 then restoreBoatCollision();inputOff();enemy=nil;state.attack=false;state.skills=false;phase("AGUARDANDO RESPAWN");return end
         if root~=lastRoot then lastRoot=root;expectedBoat=nil;enemy=nil;requestedAt=nil end
         if lastEnemy and not valid(lastEnemy)then
             local health=enemyHealth(lastEnemy)
             if health and health<=0 then info.kills=info.kills+1 end
             lastEnemy=nil
         end
-        if not valid(enemy)or os.clock()>=enemyScanAt then enemy=findEnemy(root);enemyScanAt=os.clock()+1 end
+        if os.clock()>=enemyScanAt or(enemy and not seaAlive(enemy))then enemy=findEnemy(root);enemyScanAt=os.clock()+1 end
         if enemy then
-            inputOff();lastEnemy=enemy;target=enemy
+            if travel and travel.owner=="seabeast"then cancelTravel()end
+            restoreBoatCollision();if boat then brakeBoat()else inputOff()end;lastEnemy=enemy;target=enemy
             if state.skillCasting or(bossGuardian and bossGuardian.busy())then phase("AGUARDANDO SKILL / ESQUIVA NATIVA");return end
-            hum.Sit=false;noclip.set("seabeast",true)
-            local part=enemy.HumanoidRootPart
+            noclip.set("seabeast",true)
+            if hum.SeatPart then
+                hum.Sit=false;hum.Jump=true;state.attack=false;state.skills=false
+                phase("DESEMBARCANDO PARA PARTIR PRA CIMA DO ABYSSAL BEAST");return
+            end
+            hum.Sit=false
+            local part=seaPart(enemy)
             local ocean=shared.GetWaveHeight(part.Position.X,part.Position.Z,workspace:GetServerTimeNow(),nil)
-            if part.Position.Y<ocean-12 then state.attack=false;state.skills=false;phase("SEA BEAST MERGULHANDO; AGUARDANDO SUPERFICIE");return end
-            local p=part.Position+Vector3.new(0,math.max(5,ocean+3-part.Position.Y),10)
+            local altitude=math.max(ocean+28,part.Position.Y+10)
+            if root.Position.Y<ocean+18 then
+                state.attack=false;state.skills=false
+                flyTo(root,Vector3.new(root.Position.X,altitude,root.Position.Z),dt)
+                phase("SAINDO DO BARCO E SUBINDO PARA O ABYSSAL BEAST");return
+            end
+            local p=Vector3.new(part.Position.X,altitude,part.Position.Z+8)
             flyTo(root,p,dt)
-            state.attack=(root.Position-part.Position).Magnitude<=18
+            state.attack=(root.Position-part.Position).Magnitude<=110 and part.Position.Y>=ocean-110
             state.skills=state.attack
-            phase("COMBATE: "..original(enemy).."; EQUIPAMENTOS DO FARM")
+            info.seaTarget={name=original(enemy),distance=math.floor((root.Position-part.Position).Magnitude),rootY=part.Position.Y}
+            phase("ATACANDO ABYSSAL BEAST: "..original(enemy))
             return
         end
         state.attack=false;state.skills=false;target=nil
         if onlyExisting then
-            inputOff();noclip.set("seabeast",false)
+            if travel and travel.owner=="seabeast"then cancelTravel()end
+            restoreBoatCollision();inputOff();noclip.set("seabeast",false)
             phase("PROCURANDO SEA BEAST JA SPAWNADO; SEM USAR BARCO");return
         end
-        boat=ownBoat()
+        local rearLaunch,farGoal,rearDir=volcanoRearInfo()
+        local foundBoat=ownBoat()
+        if foundBoat then
+            local seat=foundBoat:FindFirstChild("DriverSeat",true)
+            local onBoat=seat and hum.SeatPart==seat
+            local nearPlayer=(foundBoat:GetPivot().Position-root.Position).Magnitude<=600
+            if not onBoat and not nearPlayer and rearLaunch and flat(foundBoat:GetPivot().Position-rearLaunch).Magnitude>1500 then
+                foundBoat=nil
+            end
+        end
+        if foundBoat~=boat then arrived=false;info.arrived=false;restoreBoatCollision();waypoint=nil;if routePlanner then routePlanner.reset()end;progressDistance=nil;progressAt=os.clock()end
+        boat=foundBoat
+        boatNoclip(boat)
         if not boat then
-            inputOff();noclip.set("seabeast",false)
-            if spawnBusy or os.clock()<(requestedAt or 0)then phase("AGUARDANDO SPAWN / COOLDOWN DO BARCO");return end
+            inputOff()
+            if rearLaunch and flat(root.Position-rearLaunch).Magnitude>220 then
+                if hum.SeatPart then hum.Sit=false;hum.Jump=true;return end
+                noclip.set("seabeast",true)
+                if not travel or travel.owner~="seabeast"then
+                    beginTravel(rearLaunch,"Atrás de Volcano Island","seabeast","Volcano Island",false)
+                end
+                phase("VOANDO ATE ATRAS DA ILHA DO VULCAO ("..tostring(math.floor(flat(root.Position-rearLaunch).Magnitude)).." STUDS)")
+                return
+            end
+            if travel and travel.owner=="seabeast"then cancelTravel()end
+            noclip.set("seabeast",true)
+            if spawnBusy or os.clock()<(requestedAt or 0)then phase("AGUARDANDO SPAWN / COOLDOWN DO BARCO ATRAS DO VULCAO");return end
             if os.clock()<inventoryCheckAt then return end
             inventoryCheckAt=os.clock()+1
             local tool=boatTool(hum);if not tool then return end
             if os.clock()<(nextAction or 0)then return end
             local cf=waterPlacement(root,tool)
-            if not cf then phase("APROXIME-SE DO MAR: SEM AGUA LIVRE ATE 200 STUDS");return end
-            spawnBusy=true;requestedAt=os.clock()+15;phase("LANCANDO BARCO NO MAR: "..tool.Name)
+            if not cf then phase("PROCURANDO AGUA LIVRE ATRAS DO VULCAO PARA PUXAR O BARCO");return end
+            if rearDir then
+                cf=CFrame.lookAt(cf.Position,cf.Position+rearDir)
+            end
+            local launchDelta=flat(cf.Position-root.Position)
+            if launchDelta.Magnitude>200 then
+                local approach=cf.Position-launchDelta.Unit*120
+                approach=Vector3.new(approach.X,math.max(root.Position.Y,(oceanBase or cf.Position.Y)+18),approach.Z)
+                flyTo(root,approach,dt)
+                inventoryCheckAt=0
+                phase("POSICIONANDO ATRAS DO VULCAO PARA PUXAR O BARCO: "..tostring(math.floor(launchDelta.Magnitude)).." STUDS");return
+            end
+            spawnBusy=true;requestedAt=os.clock()+15;phase("PUXANDO BARCO ATRAS DO VULCAO: "..tool.Name)
             task.spawn(function()
                 local ok,result=pcall(function()return clientAPI().Network:SafeInvokeServer(10,"SpawnBoat","Spawn",tool.Name,cf)end)
                 spawnBusy=false
@@ -8306,60 +9284,39 @@ seaBeastController=(function()
             end)
             return
         end
-        goal=goal or destination()
-        if not goal then phase("AGUARDANDO REFERENCIAS DE VOLCANO ISLAND");return end
-        info.boat=boat.Name;info.destination={x=goal.X,y=goal.Y,z=goal.Z}
+        if travel and travel.owner=="seabeast"then cancelTravel()end
         local seat=boat:FindFirstChild("DriverSeat",true)
         if not seat or not seat:IsA("Seat")and not seat:IsA("VehicleSeat")then phase("BARCO SEM ASSENTO DE PILOTO");return end
         if hum.SeatPart~=seat then
-            noclip.set("seabeast",true);inputOff()
+            noclip.set("seabeast",true);brakeBoat()
             if (root.Position-seat.Position).Magnitude>4 then flyTo(root,seat.Position+Vector3.new(0,2,0),dt)
             else seat:Sit(hum)end
             phase("EMBARCANDO NO PROPRIO BARCO");return
         end
-        noclip.set("seabeast",false)
-        local distance=flat(boat:GetPivot().Position-goal).Magnitude;info.distance=math.floor(distance)
-        if distance<80 then
-            flight=false;expectedBoat=nil
-            brakeBoat();phase("AGUARDANDO SPAWN NATURAL; SORTEIO A CADA "..tostring(settings.NaturalSpawn.RollInterval).."s")
-            return
-        end
-        if flight then
-            if os.clock()-progressAt>3 then
-                if progressDistance and progressDistance-distance<10 then corrections=3 end
-                progressDistance=distance;progressAt=os.clock()
-            end
-            inputOff()
-            local cf=boat:GetPivot()
-            if expectedBoat and(cf.Position-expectedBoat).Magnitude>35 then corrections=corrections+1 end
-            if corrections>=3 then
-                flight=false;expectedBoat=nil
-                notify("Barco corrigido pelo servidor. Continuando pela navegacao nativa.")
-                return
-            end
-            local delta=flat(goal-cf.Position);local direction=delta.Unit
-            local p=cf.Position+direction*math.min(delta.Magnitude,100*math.min(dt,.05))
-            local sea=shared.GetWaveHeight(p.X,p.Z,workspace:GetServerTimeNow(),nil)
-            p=Vector3.new(p.X,math.max(sea+12,cf.Position.Y),p.Z)
-            local nextCF=CFrame.lookAt(p,p+direction)
-            local relative=cf:ToObjectSpace(root.CFrame)
-            boat:PivotTo(nextCF);root.CFrame=nextCF*relative
-            root.AssemblyLinearVelocity=Vector3.zero
-            expectedBoat=p;phase("VOANDO COM BARCO PARA TRAS DE VOLCANO ISLAND");return
-        end
+        noclip.set("seabeast",true)
+        local current=boat:GetPivot().Position
+        local forwardDir=rearDir or flat(boat:GetPivot().LookVector)
+        if forwardDir.Magnitude<0.01 then forwardDir=Vector3.new(-0.816,0,0.578)else forwardDir=forwardDir.Unit end
+        local continuousGoal=current+forwardDir*3000
+        info.boat=boat.Name;info.destination={x=continuousGoal.X,y=continuousGoal.Y,z=continuousGoal.Z}
+        info.distance=3000
         nav.KinematicBoatSystemClient.SetInputProvider(function(model)
-            if not enabled or model~=boat then return 0,0 end
-            local cf=model:GetPivot();local delta=flat(goal-cf.Position)
-            if delta.Magnitude<80 then return 0,0 end
-            local forward=flat(cf.LookVector).Unit;local direction=delta.Unit
-            local angle=math.atan2(forward:Cross(direction).Y,forward:Dot(direction))
-            return math.abs(angle)>1 and .25 or 1,math.clamp(-angle*1.5,-1,1)
+            if not enabled or model~=boat or enemy then return 0,0 end
+            local cf=model:GetPivot()
+            local display=nav.KinematicBoatSystemClient.GetDisplayedState(model)
+            local forward=display and type(display.Yaw)=="number"and Vector3.new(-math.sin(display.Yaw),0,-math.cos(display.Yaw))or flat(cf.LookVector).Unit
+            local angle=math.atan2(forward:Cross(forwardDir).Y,forward:Dot(forwardDir))
+            local yawRate=display and display.YawRate or 0
+            local steer=math.clamp(-angle*1.5+yawRate*1.15,-1,1)
+            info.control={speed=math.floor(display and display.Speed or 0),wanted=100,headingError=math.floor(math.deg(angle)),throttle=1,steer=steer}
+            return 1,steer
         end)
-        phase("NAVEGANDO PARA TRAS DE VOLCANO ISLAND")
+        info.navigation="FORWARD_CONTINUOUS";info.boatNoclip=true;info.detour=false
+        phase("INDO PARA FRENTE CONTINUAMENTE; PROCURANDO SEA BEAST")
     end
-    section:AddParagraph({Title="Combate",Content="Usa Equipamentos e Skills de Farm e missoes. O spawn e decidido pelo servidor."})
-    section:AddToggle("SeaBeastBoatFlight",{Title="Voar com o barco",Default=true,Callback=function(v)flight=v;corrections=0;expectedBoat=nil end})
+    statusPanel=internalStatus({Title="Estado da navegacao",Content="DESLIGADO: ative Auto navegacao + Sea abaixo."})
     local function activate(value,only)
+        info.lastRequest={enabled=value,onlyExisting=only,at=os.clock()}
         if not value then
             if onlyExisting==only then stop()end
             return
@@ -8368,38 +9325,50 @@ seaBeastController=(function()
             if toggle and toggle.Value then toggle:SetValue(false)end
         elseif onlyToggle and onlyToggle.Value then onlyToggle:SetValue(false)end
         onlyExisting=only
-        for _,id in ipairs({"StoryFarm","FishingFarm","FarmAutomatico","BossFarm","CollectibleFarm","FreeFly","FruitCollect"})do
+        for _,id in ipairs({"StoryFarm","FishingFarm","FarmAutomatico","MaterialFarm","BossFarm","EventSwordFarm","CollectibleFarm","FreeFly","FruitCollect"})do
             local option=Fluent.Options[id];if option and option.Value then option:SetValue(false)end
         end
         cancelTravel();previousBosses=state.bosses;state.bosses=true
-        enabled=true;nextAction=0;requestedAt=0;corrections=0;goal=nil
+        launchPoint=nil;launchScanAt=0;routeRetryAt=0;controlTurnSide=nil;cruiseReverse=false;islandScanAt=0;if routePlanner then routePlanner.reset()end
+        enabled=true;nextAction=0;requestedAt=0;corrections=0;goal=nil;goalMarker=false;arrived=false;info.arrived=false
         progressDistance=nil;progressAt=0;enemyScanAt=0;inventoryCheckAt=0
-        phase("INICIANDO")
+        info.error=nil;phase("INICIANDO: PROCURANDO SEA BEAST / BARCO")
     end
-    toggle=section:AddToggle("SeaBeastFarm",{Title="Auto navegacao + Sea",Default=false,Callback=function(v)activate(v,false)end})
-    onlyToggle=section:AddToggle("SeaBeastOnly",{Title="So Sea spawnado",Default=false,Callback=function(v)activate(v,true)end})
+    local function request(value,only)
+        local ok,err=xpcall(function()activate(value,only)end,function(e)return tostring(e)end)
+        if not ok then
+            info.error=err;phase("ERRO AO ATIVAR: "..err)
+            pcall(notify,"Sea Beast: "..err)
+        end
+    end
+    toggle=section:AddToggle("SeaBeastFarm",{Title="Auto navegacao + Sea",Default=false,Callback=function(v)request(v,false)end})
+    onlyToggle=section:AddToggle("SeaBeastOnly",{Title="So Sea spawnado",Default=false,Callback=function(v)request(v,true)end})
     table.insert(connections,RS.Heartbeat:Connect(function(dt)
+        info.enabled=enabled;info.autoRequested=toggle.Value;info.onlyRequested=onlyToggle.Value;info.heartbeatAt=os.clock()
         if state.alive then
             local ok,err=pcall(step,dt)
             if not ok then info.error=tostring(err);toggle:SetValue(false);onlyToggle:SetValue(false);notify("Sea Beast interrompido: "..tostring(err))end
         end
     end))
-    return {active=function()return enabled end,pick=function()return enemy end,stop=stop,debug=function()return info end}
+    return {active=function()return enabled end,pick=function()return enemy end,stop=stop,set=function(value,only)if only then onlyToggle:SetValue(value)else toggle:SetValue(value)end end,debug=function()return info end}
 end)()
 
 local configSpec = {
-    {"SeaBeastBoatFlight","boolean"},
-    {"FruitESP","boolean"}, {"AutoArmament","boolean"},
+    {"FruitESP","boolean"}, {"FruitCollect","boolean"}, {"FruitStore","boolean"}, {"AutoArmament","boolean"},
+    {"FarmMode","string",{"Quest","História"}},
+    {"MaterialName","string"}, {"MaterialQuest","boolean"}, {"MaterialFarm","boolean"},
+    {"EventSwordChoice","string",{"Azure Glaive","Blazebound","Golden Rapier","Shadow Blade","Tenrai"}}, {"EventSwordFarm","boolean"},
+    {"SeaBeastFarm","boolean"}, {"SeaBeastOnly","boolean"},
     {"AutoStatTargets","table"}, {"AutoStats","boolean"}, {"StoryFarm","boolean"}, {"FishingFarm","boolean"}, {"BossGuard","boolean"},
     {"WalkSpeedPreset","string",{"alta","máxima"}}, {"FlySpeedPreset","string",{"lento","normal","rápido"}},
-    {"PersonalSpeed","boolean"}, {"SuperJump","boolean"}, {"InfiniteJump","boolean"}, {"FreeFly","boolean"},
+    {"PersonalSpeed","boolean"}, {"SuperJump","boolean"}, {"InfiniteJump","boolean"}, {"InfiniteDash","boolean"}, {"FreeFly","boolean"},
     {"MovePreset", "string", {"suave", "normal", "rápido"}}, {"AttackPreset", "string", {"moderada", "rápida", "máxima"}}, 
     {"CombatLoadout","table"}, {"FruitFinish","boolean"}, {"Weapon", "string"}, {"BossName", "string"}, {"BossFarm", "boolean"}, {"MenuKeybind", "string"}, {"Position", "string", {"atrás", "acima", "frente"}},
     {"Distance", "number", 2, 15}, {"Height", "number", -5, 15},
     {"Radius", "number", 20, 2500}, {"TravelSpeed", "number", 30, 500},
     {"FastAttack", "boolean"}, {"FastAttackRate", "number", 5, 20}, {"AttackInterval", "number", 0.15, 2}, {"SkillInterval", "number", 1, 12},
     {"Skills", "table"}, {"ESP", "boolean"}, {"PlayerESP", "boolean"},
-    {"PlayerESPDistance", "number", 10, 10000}, {"TravelAltitude", "number", 30, 30},
+    {"TravelAltitude", "number", 30, 30},
     {"FOV", "number", 40, 110}, {"Theme", "string", themes}, {"FarmAutomatico", "boolean"},
 }
 local configBusy = false
@@ -8515,18 +9484,24 @@ local function loadConfig(quiet)
     -- O farm e restaurado por ultimo, apos aplicar todas as outras opcoes.
     for _, spec in ipairs(configSpec) do
         local id, value = spec[1], data.options[spec[1]]
-        if id ~= "FarmAutomatico" and id ~= "BossFarm" and id~="StoryFarm" and id~="FishingFarm" and value ~= nil and Fluent.Options[id] then
+        if id ~= "FarmAutomatico" and id ~= "MaterialFarm" and id ~= "BossFarm" and id~="StoryFarm" and id~="FishingFarm" and id~="EventSwordFarm" and id~="SeaBeastFarm" and id~="SeaBeastOnly" and value ~= nil and Fluent.Options[id] then
             if id == "Skills" then
                 local selected = {}
                 for key, enabled in pairs(value) do if enabled then selected[key] = true end end
                 value = selected
             end
-            if id ~= "Weapon" or table.find(weaponDrop.Values, value) then Fluent.Options[id]:SetValue(value) end
+            if id ~= "Weapon" or table.find(weaponDrop.Values, value) then uiCall(function() Fluent.Options[id]:SetValue(value) end) end
         end
     end
-    if data.options.FishingFarm==true then Fluent.Options.FishingFarm:SetValue(true)
-    elseif data.options.StoryFarm==true then Fluent.Options.StoryFarm:SetValue(true)
+    if data.options.EventSwordFarm==true and Fluent.Options.EventSwordFarm then Fluent.Options.EventSwordFarm:SetValue(true)
+    elseif data.options.SeaBeastFarm==true and Fluent.Options.SeaBeastFarm then Fluent.Options.SeaBeastFarm:SetValue(true)
+    elseif data.options.SeaBeastOnly==true and Fluent.Options.SeaBeastOnly then Fluent.Options.SeaBeastOnly:SetValue(true)
+    elseif data.options.FishingFarm==true then Fluent.Options.FishingFarm:SetValue(true)
+    elseif data.options.StoryFarm==true then
+        if Fluent.Options.FarmMode then Fluent.Options.FarmMode:SetValue("História") end
+        farmControl:SetValue(true)
     elseif data.options.BossFarm == true then bossControl:SetValue(true)
+    elseif data.options.MaterialFarm == true and materialControl then materialControl:SetValue(true)
     elseif data.options.FarmAutomatico == true then farmControl:SetValue(true) end
     if not quiet then notify("Configuracoes carregadas.") end
 end
@@ -8577,6 +9552,8 @@ do
     table.insert(connections,canvas.DescendantAdded:Connect(watch))
 end
 env.SOWxTEAM.test={
+    sea=function(value,only)seaBeastController.set(value==true,only==true)end,
+    seaSnapshot=function()return seaBeastController.debug()end,
     story=function(value)
         local option=Fluent.Options.StoryFarm
         assert(option,"Controle de historia indisponivel");option:SetValue(value==true)
